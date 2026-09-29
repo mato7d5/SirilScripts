@@ -11,6 +11,7 @@ and reports progress into Siril's log, so the Siril window stays responsive.
 | [`SirilChannelExtract.py`](SirilChannelExtract.py) | Detects whether a sequence holds OSC (one-shot colour) data and extracts the R, G or B channel into a new sequence. |
 | [`VarStarOSCPreprocess.py`](VarStarOSCPreprocess.py) | Full OSC preprocessing: masters, light calibration, registration and optional single-channel extraction — deliberately stopping before stacking. |
 | [`DepthFITSConversion.py`](DepthFITSConversion.py) | Converts a folder of FITS files, or the frames of one sequence, between 32-bit float and 16-bit unsigned integer, reporting any clipping. |
+| [`Selector.py`](Selector.py) | Measures FWHM, eccentricity, star count and background of every calibrated light frame, shows them in a table and charts with a keep / reject suggestion, deletes, moves or unselects the frames you reject, and copies or moves the accepted ones to an `accepted` subfolder. |
 
 ## Requirements
 
@@ -19,7 +20,7 @@ and reports progress into Siril's log, so the Siril window stays responsive.
   PyQt6 6.11 / Qt 6.11), so normally there is nothing to install. If it is
   somehow missing, the scripts ask `sirilpy.ensure_installed()` for it. The
   scripts that have a `--no-gui` mode do not need Qt at all in that mode;
-  `SirilSync.py` is GUI-only and always needs it.
+  `SirilSync.py` and `Selector.py` are GUI-only and always need it.
 
 ## Installation
 
@@ -39,7 +40,8 @@ python siril_dark_calibration.py --work-dir "D:/astro/M31" --no-gui
 ```
 
 `SirilSync.py` has no command-line interface — it is GUI only, because it needs
-an image loaded in the running Siril instance.
+an image loaded in the running Siril instance. `Selector.py` is GUI only as
+well: rejecting frames is a decision you make while looking at the charts.
 
 ## The dialogs
 
@@ -845,3 +847,124 @@ Frames that rotate between exposures, so interpolation is unavoidable:
 ```bash
 python VarStarOSCPreprocess.py --work-dir "D:/astro/RR_Lyr" --interp lanczos4 --transf homography --no-gui
 ```
+
+---
+
+# Selector.py
+
+## What it is for
+
+Before stacking you want to throw out the bad subs: frames with soft stars
+(seeing, focus), elongated stars (tracking, wind), few stars (clouds, haze,
+dew) or a bright sky (moon, dawn). Selector measures every calibrated light
+frame, shows the numbers in a table and in charts, suggests which frames to
+reject and why, and then removes the ones you finally mark.
+
+## Workflow
+
+1. Run **Selector** from the Scripts menu. The folder starts at Siril's working
+   directory.
+2. Choose the input: a **sequence** (`.seq` or `.ser`) from the folder or one
+   of its direct subfolders (e.g. `process/pp_light_`), or the **individual
+   files** in the folder itself (FITS, `.fz`-compressed FITS, TIFF, XISF).
+   Picking a sequence from the list switches to sequence mode.
+3. Press **Analyse**.
+4. Look at the table and the charts, adjust the limits — the suggestions update
+   at once — and tick / untick **Reject** for individual frames if you disagree.
+5. Optionally **Export CSV...** the statistics.
+6. Choose what happens to the rejected frames and press **Apply** — and/or
+   copy or move the accepted frames to an `accepted` subfolder with the
+   second **Apply**.
+
+## How the frames are measured
+
+| Input | Method |
+| --- | --- |
+| Sequence with star data | The registration data already stored in the `.seq` is used: FWHM, weighted FWHM, roundness, star count, background. |
+| Sequence without star data | `register <seq> -2pass` is run first. With `-2pass` Siril only measures and computes the transforms — no registered images are written. Tick *Re-measure* to force this even when data exists (it replaces the registration data in the `.seq`). |
+| Undebayered (CFA) sequence | Siril refuses to register a CFA sequence, so each frame is measured on its own, as below. Star measurements on a CFA mosaic are less precise than on debayered data. |
+| Individual files | Each file is loaded and `findstar` is run; the **median** FWHM and roundness of the detected stars are used, the background is the median of the image (green channel for colour data). |
+
+Eccentricity is computed from Siril's roundness *r* (minor / major FWHM) as
+*e* = √(1 − *r*²): 0 is a perfectly round star, 0.5 is barely visible
+elongation, above ~0.6 stars look clearly oval.
+
+## Rejection criteria
+
+Every criterion is a plain value in the metric's own units — a frame fails it
+when its value is past that limit. Tick the criteria you want to use.
+
+| Metric | Default | Rejected when | Proposed limit |
+| --- | --- | --- | --- |
+| FWHM | on | FWHM > max (px) | median + 2σ |
+| Eccentricity | on | eccentricity > max | 0.60 (higher only when every frame is more elongated) |
+| Stars | on | stars < min | half the median |
+| Background | off | background > max | median + 3σ |
+
+After each analysis the limits are filled in with the proposed values
+(σ = 1.4826 · MAD, a robust spread, so a few bad frames do not widen it).
+Overwrite them with your own values — e.g. FWHM max `6.27` px — and the
+suggestions update at once; **Propose from data** brings the proposals back.
+Next to each limit the median and the range (min – max) of the data are shown,
+together with how many frames fail it.
+
+A frame in which no stars were found is always suggested for rejection.
+Changing a limit recomputes the suggestions and resets your own ticks to them.
+
+## The table
+
+| Column | Meaning |
+| --- | --- |
+| `#` | Frame number in the sequence / file order |
+| Reject | Your decision — starts as the suggestion, click to change |
+| Suggestion | `keep` or `REJECT` |
+| FWHM, wFWHM | Star FWHM in pixels; wFWHM is Siril's weighted FWHM (sequences only), which also penalises frames with fewer stars |
+| Eccentricity, Roundness | Star elongation |
+| Stars | Number of detected stars |
+| Background, Noise | Sky level and background noise (0–1 for float data, ADU for integer data) |
+| Date | `DATE-OBS` of the frame |
+| Reason | Why the frame is suggested for rejection, e.g. `FWHM 4.19 > 3.12` |
+
+Rows marked for rejection are tinted red, rows where your decision differs from
+the suggestion orange. Columns sort by value. **Double-click** a row to open
+that frame in Siril for a visual check.
+
+## The charts
+
+FWHM, eccentricity, stars and background are plotted against the frame number,
+with the median and the limit as dashed lines. Blue points are kept, red ones
+rejected, orange ones differ from the suggestion. Hover a point for its values,
+click it to select the frame in the table.
+
+## Applying the decision
+
+Rejected and accepted frames each have their own action and **Apply** button;
+you can use either one or both.
+
+**Rejected frames** (marked *Reject*):
+
+| Action | What happens |
+| --- | --- |
+| Delete the files | The rejected files are deleted permanently (after a confirmation). |
+| Move to the `rejected` subfolder | The files are moved to `<folder>/rejected`, so you can bring them back. |
+| Only unselect them in the sequence | The files stay; the frames are excluded in the `.seq` with `unselect` (sequences only). |
+
+**Accepted frames** (not marked):
+
+| Action | What happens |
+| --- | --- |
+| Copy to the `accepted` subfolder | The accepted files are copied to `<folder>/accepted`; the originals stay. |
+| Move to the `accepted` subfolder | The accepted files are moved to `<folder>/accepted`; only the rejected ones are left behind. |
+
+For a **sequence**, `<folder>` is the folder of the `.seq`, and a new sequence
+of the same name (e.g. `accepted/pp_light_.seq`) is created from the accepted
+files, ready to be registered and stacked; it also shows up in the sequence
+list. Files already in `accepted/` are kept, files with the same name are
+replaced — empty the folder first when you run the selection again with
+stricter limits.
+
+When files of a **sequence** are deleted or moved out, the sequence is closed in
+Siril, its `.seq` is removed and rebuilt from the remaining files. The rebuilt
+sequence has no registration data, so **register it again** before stacking.
+Frames stored inside a single SER / FITSEQ file cannot be removed, copied or
+moved one by one — use *unselect* for those.
