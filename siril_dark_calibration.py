@@ -48,6 +48,7 @@ with --no-gui the script runs straight away, without a window.
 from __future__ import annotations
 
 import argparse
+import html
 import os
 import sys
 import threading
@@ -63,10 +64,17 @@ try:
 except ImportError:  # builds of sirilpy without LogColor
     LogColor = None
 
+# PyQt6 is the Qt binding that ships in Siril's own Python environment
+# (Siril 1.4 bundles PyQt6 6.11 / Qt 6.11). Kept tolerant so --no-gui still
+# works on an installation without it.
 try:
-    from sirilpy import tksiril  # matches the GUI to Siril's theme (1.4.x)
+    from PyQt6 import QtCore, QtGui, QtWidgets
 except ImportError:
-    tksiril = None
+    try:
+        s.ensure_installed("PyQt6")
+        from PyQt6 import QtCore, QtGui, QtWidgets
+    except Exception:
+        QtCore = QtGui = QtWidgets = None
 
 
 # Extensions of DSLR/mirrorless RAW files that Siril (libraw) can read.
@@ -102,6 +110,16 @@ STRETCH_LABELS = {
     "none": "None (linear, for stacking)",
     "autostretch": "Autostretch (viewing only)",
     "asinh": "Asinh (viewing only)",
+}
+
+
+# Siril's log colours, in a light and a dark variant so the embedded log stays
+# readable whichever theme Siril is set to.
+LOG_COLOURS = {
+    "light": {"green": "#1b6e2b", "salmon": "#b34a20", "blue": "#14539a",
+              "red": "#b3261e"},
+    "dark": {"green": "#7fd18c", "salmon": "#ffb08f", "blue": "#7cb6f2",
+             "red": "#ff9b94"},
 }
 
 
@@ -538,459 +556,479 @@ def run_pipeline(siril, args) -> int:
 
 
 # ---------------------------------------------------------------------------
-# GUI (tkinter + tksiril - the recommended approach for Siril 1.4.x)
+# GUI (PyQt6 - the Qt binding that ships in Siril's Python environment)
 # ---------------------------------------------------------------------------
 
-def build_root():
-    """The main window; uses the themed variant when ttkthemes is available."""
-    try:
-        s.ensure_installed("ttkthemes")
-        from ttkthemes import ThemedTk
-        return ThemedTk()
-    except Exception:
-        import tkinter as tk
-        return tk.Tk()
+if QtWidgets is not None:
 
+    class CalibrationWindow(QtWidgets.QWidget):
+        """Settings dialog; the processing runs on its own thread.
 
-class CalibrationGUI:
-    """Settings dialog; the processing runs on its own thread."""
+        The worker reports back through Qt signals, which Qt delivers on the GUI
+        thread, so no widget is touched from the wrong thread.
+        """
 
-    def __init__(self, root, siril, defaults):
-        import queue
-        import tkinter as tk
-        from tkinter import ttk
+        log_line = QtCore.pyqtSignal(str, object)
+        progress_changed = QtCore.pyqtSignal(int, int)
+        run_finished = QtCore.pyqtSignal(object, object)
 
-        self.tk = tk
-        self.ttk = ttk
-        self.root = root
-        self.siril = siril
-        self.defaults = defaults
-        self.queue = queue.Queue()
-        self.running = False
-        self.alive = True
-        self.pump_id = None
+        def __init__(self, siril, defaults):
+            super().__init__()
+            self.siril = siril
+            self.running = False
+            self.log_theme = "dark" if siril_is_dark(siril) else "light"
 
-        root.title("Calibrate Lights with Master Dark")
-        root.minsize(700, 640)
+            self.setWindowTitle("Calibrate Lights with Master Dark")
+            self._build_widgets(defaults)
 
-        if tksiril is not None:
+            self.log_line.connect(self._append_log)
+            self.progress_changed.connect(self._on_progress)
+            self.run_finished.connect(self._finish)
+
+            self._autofill_dirs()
+            self._sync_sensor()
+            self._sync_cosmetic()
+            self._sync_naming()
+            self._fit_to_screen()
+
+        # -- layout ---------------------------------------------------------
+
+        def _build_widgets(self, d) -> None:
+            outer = QtWidgets.QVBoxLayout(self)
+            outer.setContentsMargins(8, 8, 8, 8)
+
             try:
-                self.style = tksiril.standard_style()
-                tksiril.match_theme_to_siril(root, siril)
+                wd = self.siril.get_siril_wd() or ""
             except Exception:
-                self.style = ttk.Style()
-        else:
-            self.style = ttk.Style()
+                wd = ""
 
-        try:
-            wd = siril.get_siril_wd() or ""
-        except Exception:
-            wd = ""
+            # --- directories ---
+            box = QtWidgets.QGroupBox("Directories")
+            grid = QtWidgets.QGridLayout(box)
+            self.ed_work = self._dir_row(
+                grid, 0, "Working directory:", d.work_dir or wd,
+                "Project directory; the lights/darks subdirectories are looked "
+                "up inside it.")
+            self.ed_work.editingFinished.connect(self._autofill_dirs)
+            self.ed_lights = self._dir_row(
+                grid, 1, "Light frames (RAW):", d.lights or "",
+                "Empty = the 'lights' subdirectory is detected automatically.")
+            self.ed_darks = self._dir_row(
+                grid, 2, "Dark frames (RAW):", d.darks or "",
+                "Empty = the 'darks' subdirectory is detected automatically.")
+            self.ed_calibrated = self._dir_row(
+                grid, 3, "Output (TIFF):", d.calibrated,
+                "Name (or path) of the directory for the calibrated TIFF "
+                "frames.", browse=False)
+            self.ed_process = self._dir_row(
+                grid, 4, "Intermediates:", d.process,
+                "Directory for the FITS sequences and the master dark.",
+                browse=False)
+            outer.addWidget(box)
 
-        d = defaults
-        self.var_work = tk.StringVar(value=d.work_dir or wd)
-        self.var_lights = tk.StringVar(value=d.lights or "")
-        self.var_darks = tk.StringVar(value=d.darks or "")
-        self.var_process = tk.StringVar(value=d.process)
-        self.var_calibrated = tk.StringVar(value=d.calibrated)
+            # --- calibration ---
+            box = QtWidgets.QGroupBox("Calibration")
+            grid = QtWidgets.QGridLayout(box)
 
-        self.var_sensor = tk.StringVar(value="Mono" if d.mono else "OSC / colour (CFA)")
-        self.var_debayer = tk.BooleanVar(value=d.debayer)
-        self.var_cosmetic = tk.BooleanVar(value=d.cosmetic)
-        self.var_cc_low = tk.StringVar(value=fmt_num(d.cc_sigma_low))
-        self.var_cc_high = tk.StringVar(value=fmt_num(d.cc_sigma_high))
+            grid.addWidget(QtWidgets.QLabel("Sensor:"), 0, 0)
+            self.cmb_sensor = QtWidgets.QComboBox()
+            self.cmb_sensor.addItems(["OSC / colour (CFA)", "Mono"])
+            self.cmb_sensor.setCurrentIndex(1 if d.mono else 0)
+            self.cmb_sensor.setToolTip(
+                "Mono disables both CFA cosmetic correction and debayering.")
+            self.cmb_sensor.currentIndexChanged.connect(self._sync_sensor)
+            grid.addWidget(self.cmb_sensor, 0, 1)
 
-        self.var_rejection = tk.StringVar(value=REJECTIONS[0][0])
-        self.var_sigma_low = tk.StringVar(value=fmt_num(d.sigma_low))
-        self.var_sigma_high = tk.StringVar(value=fmt_num(d.sigma_high))
+            self.chk_debayer = QtWidgets.QCheckBox("Debayer during calibration")
+            self.chk_debayer.setChecked(d.debayer)
+            self.chk_debayer.setToolTip(
+                "Debayer only after the dark is subtracted - darks and lights "
+                "must stay in their CFA form.")
+            grid.addWidget(self.chk_debayer, 0, 2, 1, 2)
 
-        self.var_bits = tk.StringVar(value=str(d.tiff_bits))
-        self.var_astro = tk.BooleanVar(value=d.astro)
-        self.var_deflate = tk.BooleanVar(value=d.deflate)
-        self.var_naming = tk.StringVar(
-            value="From original RAW names" if d.name_from_raw
-            else "Sequence numbering")
-        self.var_basename = tk.StringVar(value=d.tiff_basename)
-        self.var_stretch = tk.StringVar(value=STRETCH_LABELS[d.stretch])
-        self.var_pedestal = tk.StringVar(value=fmt_num(d.pedestal))
+            self.chk_cosmetic = QtWidgets.QCheckBox(
+                "Cosmetic correction from master dark")
+            self.chk_cosmetic.setChecked(d.cosmetic)
+            self.chk_cosmetic.setToolTip(
+                "calibrate -cc=dark: hot/cold pixel map taken from the dark.")
+            self.chk_cosmetic.toggled.connect(self._sync_cosmetic)
+            grid.addWidget(self.chk_cosmetic, 1, 0, 1, 2)
 
-        self.var_status = tk.StringVar(value="Ready.")
+            grid.addWidget(QtWidgets.QLabel("sigma low / high:"), 1, 2)
+            self.ed_cc_low = self._small(fmt_num(d.cc_sigma_low))
+            self.ed_cc_high = self._small(fmt_num(d.cc_sigma_high))
+            grid.addLayout(self._pair(self.ed_cc_low, self.ed_cc_high), 1, 3)
 
-        self._build_widgets()
-        self._autofill_dirs()
-        self.pump_id = self.root.after(100, self._pump)
-        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+            grid.addWidget(QtWidgets.QLabel("Dark stacking rejection:"), 2, 0)
+            self.cmb_rejection = QtWidgets.QComboBox()
+            self.cmb_rejection.addItems([name for name, _c in REJECTIONS])
+            self.cmb_rejection.setToolTip(
+                "Winsorized is a good choice for a typical number of darks.")
+            grid.addWidget(self.cmb_rejection, 2, 1)
 
-    # -- layout -------------------------------------------------------------
+            grid.addWidget(QtWidgets.QLabel("sigma low / high:"), 2, 2)
+            self.ed_sigma_low = self._small(fmt_num(d.sigma_low))
+            self.ed_sigma_high = self._small(fmt_num(d.sigma_high))
+            grid.addLayout(self._pair(self.ed_sigma_low, self.ed_sigma_high),
+                           2, 3)
+            grid.setColumnStretch(1, 1)
+            outer.addWidget(box)
 
-    def _build_widgets(self) -> None:
-        ttk, tk = self.ttk, self.tk
-        from tkinter import scrolledtext
+            # --- TIFF output ---
+            box = QtWidgets.QGroupBox("TIFF output")
+            grid = QtWidgets.QGridLayout(box)
 
-        main = ttk.Frame(self.root, padding=10)
-        main.pack(fill="both", expand=True)
-        main.columnconfigure(0, weight=1)
+            grid.addWidget(QtWidgets.QLabel("Bit depth:"), 0, 0)
+            self.cmb_bits = QtWidgets.QComboBox()
+            self.cmb_bits.addItems(["8", "16", "32"])
+            self.cmb_bits.setCurrentText(str(d.tiff_bits))
+            self.cmb_bits.setToolTip(
+                "16-bit is the usual compromise, 32-bit keeps full precision.")
+            grid.addWidget(self.cmb_bits, 0, 1)
 
-        # --- directories ---
-        box = ttk.LabelFrame(main, text="Directories", padding=8)
-        box.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-        box.columnconfigure(1, weight=1)
+            self.chk_astro = QtWidgets.QCheckBox(
+                "Astro-TIFF (FITS header inside the TIFF)")
+            self.chk_astro.setChecked(d.astro)
+            grid.addWidget(self.chk_astro, 0, 2)
+            self.chk_deflate = QtWidgets.QCheckBox("Compression (deflate)")
+            self.chk_deflate.setChecked(d.deflate)
+            grid.addWidget(self.chk_deflate, 0, 3)
 
-        self._dir_row(box, 0, "Working directory:", self.var_work, True,
-                      "Project directory; the lights/darks subdirectories are "
-                      "looked up inside it.")
-        self._dir_row(box, 1, "Light frames (RAW):", self.var_lights, True,
-                      "Empty = the 'lights' subdirectory is detected automatically.")
-        self._dir_row(box, 2, "Dark frames (RAW):", self.var_darks, True,
-                      "Empty = the 'darks' subdirectory is detected automatically.")
-        self._entry_row(box, 3, "Output (TIFF):", self.var_calibrated,
-                        "Name (or path) of the directory for the calibrated TIFF frames.")
-        self._entry_row(box, 4, "Intermediates:", self.var_process,
-                        "Directory for the FITS sequences and the master dark.")
+            grid.addWidget(QtWidgets.QLabel("Naming:"), 1, 0)
+            self.cmb_naming = QtWidgets.QComboBox()
+            self.cmb_naming.addItems(["Sequence numbering",
+                                      "From original RAW names"])
+            self.cmb_naming.setCurrentIndex(1 if d.name_from_raw else 0)
+            self.cmb_naming.setToolTip(
+                "Naming from RAW files assumes conversion in alphabetical "
+                "order.")
+            self.cmb_naming.currentIndexChanged.connect(self._sync_naming)
+            grid.addWidget(self.cmb_naming, 1, 1)
 
-        # --- calibration ---
-        box = ttk.LabelFrame(main, text="Calibration", padding=8)
-        box.grid(row=1, column=0, sticky="ew", pady=(0, 8))
-        box.columnconfigure(1, weight=1)
-        box.columnconfigure(3, weight=1)
+            grid.addWidget(QtWidgets.QLabel("Base name:"), 1, 2)
+            self.ed_basename = QtWidgets.QLineEdit(d.tiff_basename)
+            grid.addWidget(self.ed_basename, 1, 3)
 
-        ttk.Label(box, text="Sensor:").grid(row=0, column=0, sticky="w", pady=2)
-        sensor = ttk.Combobox(box, textvariable=self.var_sensor, state="readonly",
-                              values=["OSC / colour (CFA)", "Mono"])
-        sensor.grid(row=0, column=1, sticky="ew", padx=(6, 12), pady=2)
-        sensor.bind("<<ComboboxSelected>>", lambda _e: self._sync_sensor())
-        self._tip(sensor, "Mono disables both CFA cosmetic correction and debayering.")
+            grid.addWidget(QtWidgets.QLabel("Stretch:"), 2, 0)
+            self.cmb_stretch = QtWidgets.QComboBox()
+            self.cmb_stretch.addItems([STRETCH_LABELS[k] for k in STRETCH_KEYS])
+            self.cmb_stretch.setCurrentText(STRETCH_LABELS[d.stretch])
+            self.cmb_stretch.setToolTip(
+                "Calibrated data is linear and looks dark in an ordinary "
+                "viewer. A stretch makes it viewable but non-linear - never "
+                "register or stack stretched files.")
+            grid.addWidget(self.cmb_stretch, 2, 1)
 
-        self.chk_debayer = ttk.Checkbutton(
-            box, text="Debayer during calibration", variable=self.var_debayer)
-        self.chk_debayer.grid(row=0, column=2, columnspan=2, sticky="w", pady=2)
-        self._tip(self.chk_debayer,
-                  "Debayer only after the dark is subtracted - darks and lights "
-                  "must stay in their CFA form.")
+            grid.addWidget(QtWidgets.QLabel("Pedestal (ADU):"), 2, 2)
+            self.ed_pedestal = QtWidgets.QLineEdit(fmt_num(d.pedestal))
+            grid.addWidget(self.ed_pedestal, 2, 3)
+            grid.setColumnStretch(1, 1)
+            grid.setColumnStretch(3, 1)
+            outer.addWidget(box)
 
-        chk = ttk.Checkbutton(box, text="Cosmetic correction from master dark",
-                              variable=self.var_cosmetic, command=self._sync_cosmetic)
-        chk.grid(row=1, column=0, columnspan=2, sticky="w", pady=2)
-        self._tip(chk, "calibrate -cc=dark: hot/cold pixel map taken from the dark.")
+            outer.addWidget(self._log_box(), 1)
 
-        ttk.Label(box, text="sigma low / high:").grid(row=1, column=2, sticky="e", pady=2)
-        frame = ttk.Frame(box)
-        frame.grid(row=1, column=3, sticky="w", padx=(6, 0), pady=2)
-        self.ent_cc_low = ttk.Entry(frame, textvariable=self.var_cc_low, width=6)
-        self.ent_cc_low.pack(side="left")
-        self.ent_cc_high = ttk.Entry(frame, textvariable=self.var_cc_high, width=6)
-        self.ent_cc_high.pack(side="left", padx=(4, 0))
+            buttons = QtWidgets.QHBoxLayout()
+            buttons.addStretch(1)
+            btn = QtWidgets.QPushButton("Close")
+            btn.clicked.connect(self.close)
+            buttons.addWidget(btn)
+            self.btn_run = QtWidgets.QPushButton("Run calibration")
+            self.btn_run.setDefault(True)
+            self.btn_run.clicked.connect(self._start)
+            buttons.addWidget(self.btn_run)
+            outer.addLayout(buttons)
 
-        ttk.Label(box, text="Dark stacking rejection:").grid(
-            row=2, column=0, sticky="w", pady=2)
-        combo = ttk.Combobox(box, textvariable=self.var_rejection, state="readonly",
-                             values=[name for name, _code in REJECTIONS])
-        combo.grid(row=2, column=1, sticky="ew", padx=(6, 12), pady=2)
-        self._tip(combo, "Winsorized is a good choice for a typical number of darks.")
+        def _small(self, value):
+            edit = QtWidgets.QLineEdit(value)
+            edit.setFixedWidth(52)
+            return edit
 
-        ttk.Label(box, text="sigma low / high:").grid(row=2, column=2, sticky="e", pady=2)
-        frame = ttk.Frame(box)
-        frame.grid(row=2, column=3, sticky="w", padx=(6, 0), pady=2)
-        ttk.Entry(frame, textvariable=self.var_sigma_low, width=6).pack(side="left")
-        ttk.Entry(frame, textvariable=self.var_sigma_high, width=6).pack(
-            side="left", padx=(4, 0))
+        def _pair(self, first, second):
+            row = QtWidgets.QHBoxLayout()
+            row.addWidget(first)
+            row.addWidget(second)
+            row.addStretch(1)
+            return row
 
-        # --- output ---
-        box = ttk.LabelFrame(main, text="TIFF output", padding=8)
-        box.grid(row=2, column=0, sticky="ew", pady=(0, 8))
-        box.columnconfigure(1, weight=1)
-        box.columnconfigure(3, weight=1)
+        # -- the sinks the pipeline writes into ------------------------------
 
-        ttk.Label(box, text="Bit depth:").grid(row=0, column=0, sticky="w", pady=2)
-        bits = ttk.Combobox(box, textvariable=self.var_bits, state="readonly",
-                            width=8, values=["8", "16", "32"])
-        bits.grid(row=0, column=1, sticky="w", padx=(6, 12), pady=2)
-        self._tip(bits, "16-bit is the usual compromise, 32-bit keeps full precision.")
+        def sink_log(self, message, color) -> None:
+            self.log_line.emit(message, color)
 
-        chk = ttk.Checkbutton(box, text="Astro-TIFF (FITS header inside the TIFF)",
-                              variable=self.var_astro)
-        chk.grid(row=0, column=2, sticky="w", pady=2)
-        chk = ttk.Checkbutton(box, text="Compression (deflate)", variable=self.var_deflate)
-        chk.grid(row=0, column=3, sticky="w", pady=2)
+        def sink_progress(self, done, total) -> None:
+            self.progress_changed.emit(done, total)
 
-        ttk.Label(box, text="Naming:").grid(row=1, column=0, sticky="w", pady=2)
-        naming = ttk.Combobox(box, textvariable=self.var_naming, state="readonly",
-                              values=["Sequence numbering", "From original RAW names"])
-        naming.grid(row=1, column=1, sticky="ew", padx=(6, 12), pady=2)
-        naming.bind("<<ComboboxSelected>>", lambda _e: self._sync_naming())
-        self._tip(naming, "Naming from RAW files assumes conversion in alphabetical order.")
+        # -- slots, all on the GUI thread ------------------------------------
 
-        ttk.Label(box, text="Base name:").grid(row=1, column=2, sticky="e", pady=2)
-        self.ent_basename = ttk.Entry(box, textvariable=self.var_basename, width=16)
-        self.ent_basename.grid(row=1, column=3, sticky="w", padx=(6, 0), pady=2)
+        def _append_log(self, message, color=None) -> None:
+            colour = LOG_COLOURS[self.log_theme].get(
+                (color or "").lower() if color else "")
+            if colour:
+                self.text.appendHtml(
+                    '<span style="color:%s; white-space:pre">%s</span>'
+                    % (colour, html.escape(message)))
+            else:
+                self.text.appendPlainText(message)
 
-        ttk.Label(box, text="Stretch:").grid(row=2, column=0, sticky="w", pady=2)
-        stretch = ttk.Combobox(box, textvariable=self.var_stretch, state="readonly",
-                               values=[STRETCH_LABELS[key] for key in STRETCH_KEYS])
-        stretch.grid(row=2, column=1, sticky="ew", padx=(6, 12), pady=2)
-        self._tip(stretch,
-                  "Calibrated data is linear and looks dark in an ordinary viewer. "
-                  "A stretch makes it viewable but non-linear - never register or "
-                  "stack stretched files.")
+        def _on_progress(self, done, total) -> None:
+            self.progress.setValue(int(100.0 * done / max(total, 1)))
 
-        ttk.Label(box, text="Pedestal (ADU):").grid(row=2, column=2, sticky="e", pady=2)
-        ttk.Entry(box, textvariable=self.var_pedestal, width=16).grid(
-            row=2, column=3, sticky="w", padx=(6, 0), pady=2)
+        def _fit_to_screen(self, min_w=560, min_h=400) -> None:
+            """Size the window to its content, never larger than the screen."""
+            available = QtGui.QGuiApplication.primaryScreen().availableGeometry()
+            hint = self.sizeHint()
+            width = min(max(hint.width(), min_w), int(available.width() * 0.92))
+            height = min(max(hint.height(), min_h), int(available.height() * 0.85))
+            self.setMinimumSize(min(min_w, width), min(min_h, height))
+            self.resize(width, height)
+            self.move(available.x() + (available.width() - width) // 2,
+                      available.y() + (available.height() - height) // 3)
 
-        # --- progress ---
-        box = ttk.LabelFrame(main, text="Progress", padding=8)
-        box.grid(row=3, column=0, sticky="nsew")
-        box.columnconfigure(0, weight=1)
-        box.rowconfigure(2, weight=1)
-        main.rowconfigure(3, weight=1)
+        def _error(self, message: str) -> None:
+            QtWidgets.QMessageBox.critical(self, "Error", message)
 
-        ttk.Label(box, textvariable=self.var_status).grid(row=0, column=0, sticky="w")
-        self.progress = ttk.Progressbar(box, mode="determinate", maximum=100)
-        self.progress.grid(row=1, column=0, sticky="ew", pady=(4, 6))
-        self.text = scrolledtext.ScrolledText(box, height=12, wrap="none")
-        self.text.grid(row=2, column=0, sticky="nsew")
-        self.text.configure(state="disabled")
+        def _log_box(self, height=130):
+            """The progress group box every script ends with."""
+            box = QtWidgets.QGroupBox("Progress")
+            inner = QtWidgets.QVBoxLayout(box)
+            self.lbl_status = QtWidgets.QLabel("Ready.")
+            inner.addWidget(self.lbl_status)
+            self.progress = QtWidgets.QProgressBar()
+            self.progress.setRange(0, 100)
+            inner.addWidget(self.progress)
+            self.text = QtWidgets.QPlainTextEdit()
+            self.text.setReadOnly(True)
+            self.text.setLineWrapMode(QtWidgets.QPlainTextEdit.LineWrapMode.NoWrap)
+            self.text.setMinimumHeight(height)
+            inner.addWidget(self.text, 1)
+            return box
 
-        # --- buttons ---
-        buttons = ttk.Frame(main, padding=(0, 8, 0, 0))
-        buttons.grid(row=4, column=0, sticky="ew")
-        self.btn_run = ttk.Button(buttons, text="Run calibration", command=self._start)
-        self.btn_run.pack(side="right")
-        self.btn_close = ttk.Button(buttons, text="Close", command=self._on_close)
-        self.btn_close.pack(side="right", padx=(0, 6))
+        def _dir_row(self, grid, row, label, value, tip, browse=True):
+            grid.addWidget(QtWidgets.QLabel(label), row, 0)
+            edit = QtWidgets.QLineEdit(value)
+            edit.setToolTip(tip)
+            grid.addWidget(edit, row, 1)
+            if browse:
+                button = QtWidgets.QPushButton("...")
+                button.setFixedWidth(32)
+                button.clicked.connect(lambda _=False, e=edit: self._browse(e))
+                grid.addWidget(button, row, 2)
+            grid.setColumnStretch(1, 1)
+            return edit
 
-        self._sync_sensor()
-        self._sync_cosmetic()
-        self._sync_naming()
+        # -- widget callbacks -----------------------------------------------
 
-    def _dir_row(self, parent, row, label, var, browse, tip) -> None:
-        ttk = self.ttk
-        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=2)
-        entry = ttk.Entry(parent, textvariable=var)
-        entry.grid(row=row, column=1, sticky="ew", padx=6, pady=2)
-        self._tip(entry, tip)
-        if browse:
-            ttk.Button(parent, text="...", width=3,
-                       command=lambda v=var: self._browse(v)).grid(row=row, column=2)
+        def _browse(self, edit) -> None:
+            start = edit.text().strip() or self.ed_work.text().strip() \
+                or os.getcwd()
+            chosen = QtWidgets.QFileDialog.getExistingDirectory(
+                self, "Select a directory", start)
+            if chosen:
+                edit.setText(os.path.normpath(chosen))
+                if edit is self.ed_work:
+                    self.ed_lights.clear()
+                    self.ed_darks.clear()
+                    self._autofill_dirs()
 
-    def _entry_row(self, parent, row, label, var, tip) -> None:
-        ttk = self.ttk
-        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=2)
-        entry = ttk.Entry(parent, textvariable=var)
-        entry.grid(row=row, column=1, sticky="ew", padx=6, pady=2)
-        self._tip(entry, tip)
-
-    def _tip(self, widget, text) -> None:
-        if tksiril is not None:
-            try:
-                tksiril.create_tooltip(widget, text)
-            except Exception:
-                pass
-
-    # -- widget callbacks ---------------------------------------------------
-
-    def _browse(self, var) -> None:
-        from tkinter import filedialog
-        initial = var.get() or self.var_work.get() or os.getcwd()
-        chosen = filedialog.askdirectory(initialdir=initial, parent=self.root)
-        if chosen:
-            var.set(chosen)
-            if var is self.var_work:
-                self.var_lights.set("")
-                self.var_darks.set("")
-                self._autofill_dirs()
-
-    def _autofill_dirs(self) -> None:
-        """Pre-fill lights/darks if they can be found in the working directory."""
-        base = Path(self.var_work.get()) if self.var_work.get() else None
-        if not base or not base.is_dir():
-            return
-        for var, candidates, label in ((self.var_lights, LIGHT_DIR_CANDIDATES, "lights"),
-                                       (self.var_darks, DARK_DIR_CANDIDATES, "darks")):
-            if var.get():
-                continue
-            try:
-                found = resolve_dir(base, None, candidates, label)
-                var.set(str(found))
-            except CalibrationError:
-                pass
-
-    def _sync_sensor(self) -> None:
-        mono = self.var_sensor.get() == "Mono"
-        self.chk_debayer.state(["disabled"] if mono else ["!disabled"])
-
-    def _sync_cosmetic(self) -> None:
-        state = "normal" if self.var_cosmetic.get() else "disabled"
-        self.ent_cc_low.configure(state=state)
-        self.ent_cc_high.configure(state=state)
-
-    def _sync_naming(self) -> None:
-        from_raw = self.var_naming.get().startswith("From")
-        self.ent_basename.configure(state="disabled" if from_raw else "normal")
-
-    # -- starting the processing --------------------------------------------
-
-    def _collect(self):
-        """Build the same settings object argparse produces, from the form."""
-        from tkinter import messagebox
-
-        args = parse_args([])
-        work = self.var_work.get().strip()
-        if not work or not Path(work).is_dir():
-            messagebox.showerror("Error", "The working directory does not exist.",
-                                 parent=self.root)
-            return None
-
-        def number(var, label, minimum=0.0):
-            try:
-                value = float(var.get().replace(",", "."))
-            except ValueError:
-                raise ValueError(label + ": enter a number.")
-            if value < minimum:
-                raise ValueError(label + ": the value must be >= " + fmt_num(minimum))
-            return value
-
-        try:
-            args.sigma_low = number(self.var_sigma_low, "Sigma low (rejection)")
-            args.sigma_high = number(self.var_sigma_high, "Sigma high (rejection)")
-            args.cc_sigma_low = number(self.var_cc_low, "Sigma low (cosmetic correction)")
-            args.cc_sigma_high = number(self.var_cc_high,
-                                        "Sigma high (cosmetic correction)")
-            args.pedestal = number(self.var_pedestal, "Pedestal")
-        except ValueError as exc:
-            messagebox.showerror("Error", str(exc), parent=self.root)
-            return None
-
-        args.work_dir = work
-        args.lights = self.var_lights.get().strip() or None
-        args.darks = self.var_darks.get().strip() or None
-        args.process = self.var_process.get().strip() or "process"
-        args.calibrated = self.var_calibrated.get().strip() or "calibrated"
-
-        args.mono = self.var_sensor.get() == "Mono"
-        args.debayer = self.var_debayer.get() and not args.mono
-        args.cosmetic = self.var_cosmetic.get()
-        args.rejection = dict((name, code) for name, code in REJECTIONS)[
-            self.var_rejection.get()]
-
-        args.tiff_bits = int(self.var_bits.get())
-        args.astro = self.var_astro.get()
-        args.deflate = self.var_deflate.get()
-        args.name_from_raw = self.var_naming.get().startswith("From")
-        args.tiff_basename = self.var_basename.get().strip() or "light"
-        args.stretch = dict((label, key)
-                            for key, label in STRETCH_LABELS.items())[
-                                self.var_stretch.get()]
-        return args
-
-    def _start(self) -> None:
-        if self.running:
-            return
-        args = self._collect()
-        if args is None:
-            return
-
-        self.running = True
-        self.btn_run.state(["disabled"])
-        self.progress.configure(value=0)
-        self._clear_log()
-        self.var_status.set("Processing...")
-
-        thread = threading.Thread(target=self._worker, args=(args,), daemon=True)
-        thread.start()
-
-    def _worker(self, args) -> None:
-        """Runs off the GUI thread; every Siril command is issued from here."""
-        try:
-            count = run_pipeline(self.siril, args)
-            self.queue.put(("done", count, None))
-        except CalibrationError as exc:
-            self.queue.put(("done", 0, str(exc)))
-        except Exception as exc:
-            self.queue.put(("done", 0, exc.__class__.__name__ + ": " + str(exc)))
-
-    # -- passing messages from the worker thread to the GUI -----------------
-
-    def sink_log(self, message, color) -> None:
-        self.queue.put(("log", message, color))
-
-    def sink_progress(self, done, total) -> None:
-        self.queue.put(("progress", done, total))
-
-    def _pump(self) -> None:
-        import queue as queue_mod
-        if not self.alive:
-            return
-        try:
-            while True:
-                item = self.queue.get_nowait()
-                kind = item[0]
-                if kind == "log":
-                    self._append_log(item[1])
-                    if item[1].startswith("["):
-                        self.var_status.set(item[1])
-                elif kind == "progress":
-                    done, total = item[1], item[2]
-                    self.progress.configure(value=100.0 * done / max(total, 1))
-                elif kind == "done":
-                    self._finish(item[1], item[2])
-        except queue_mod.Empty:
-            pass
-        self.pump_id = self.root.after(100, self._pump)
-
-    def _append_log(self, message) -> None:
-        self.text.configure(state="normal")
-        self.text.insert("end", message + "\n")
-        self.text.see("end")
-        self.text.configure(state="disabled")
-
-    def _clear_log(self) -> None:
-        self.text.configure(state="normal")
-        self.text.delete("1.0", "end")
-        self.text.configure(state="disabled")
-
-    def _finish(self, count, error) -> None:
-        from tkinter import messagebox
-        self.running = False
-        self.btn_run.state(["!disabled"])
-        if error:
-            self.var_status.set("Processing failed.")
-            self._append_log("ERROR: " + error)
-            messagebox.showerror("Calibration failed", error, parent=self.root)
-        else:
-            self.var_status.set("Done - frames saved: " + str(count))
-            self.progress.configure(value=100)
-            messagebox.showinfo(
-                "Done",
-                "Frames calibrated and saved: " + str(count),
-                parent=self.root)
-
-    def _on_close(self) -> None:
-        from tkinter import messagebox
-        if self.running:
-            if not messagebox.askyesno(
-                    "Processing is running",
-                    "Processing is still running. Close the window anyway?",
-                    parent=self.root):
+        def _autofill_dirs(self) -> None:
+            """Pre-fill lights/darks if they can be found in the working dir."""
+            text = self.ed_work.text().strip()
+            base = Path(text) if text else None
+            if base is None or not base.is_dir():
                 return
-        # stop the queue pump first, otherwise the pending callback fires
-        # after the window is gone and Tcl reports an invalid command
-        self.alive = False
-        if self.pump_id is not None:
+            for edit, candidates, label in (
+                    (self.ed_lights, LIGHT_DIR_CANDIDATES, "lights"),
+                    (self.ed_darks, DARK_DIR_CANDIDATES, "darks")):
+                if edit.text().strip():
+                    continue
+                try:
+                    edit.setText(str(resolve_dir(base, None, candidates, label)))
+                except CalibrationError:
+                    pass
+
+        def _sync_sensor(self) -> None:
+            self.chk_debayer.setEnabled(self.cmb_sensor.currentIndex() == 0)
+
+        def _sync_cosmetic(self) -> None:
+            on = self.chk_cosmetic.isChecked()
+            self.ed_cc_low.setEnabled(on)
+            self.ed_cc_high.setEnabled(on)
+
+        def _sync_naming(self) -> None:
+            self.ed_basename.setEnabled(self.cmb_naming.currentIndex() == 0)
+
+        # -- starting the processing ----------------------------------------
+
+        def _collect(self):
+            """Build the same settings object argparse produces, from the form."""
+            args = parse_args([])
+            work = self.ed_work.text().strip()
+            if not work or not Path(work).is_dir():
+                self._error("The working directory does not exist.")
+                return None
+
+            def number(edit, label, minimum=0.0):
+                try:
+                    value = float(edit.text().replace(",", "."))
+                except ValueError:
+                    raise ValueError(label + ": enter a number.")
+                if value < minimum:
+                    raise ValueError(label + ": the value must be >= "
+                                     + fmt_num(minimum))
+                return value
+
             try:
-                self.root.after_cancel(self.pump_id)
-            except Exception:
-                pass
-        self.root.destroy()
+                args.sigma_low = number(self.ed_sigma_low,
+                                        "Sigma low (rejection)")
+                args.sigma_high = number(self.ed_sigma_high,
+                                         "Sigma high (rejection)")
+                args.cc_sigma_low = number(self.ed_cc_low,
+                                           "Sigma low (cosmetic correction)")
+                args.cc_sigma_high = number(self.ed_cc_high,
+                                            "Sigma high (cosmetic correction)")
+                args.pedestal = number(self.ed_pedestal, "Pedestal")
+            except ValueError as exc:
+                self._error(str(exc))
+                return None
+
+            args.work_dir = work
+            args.lights = self.ed_lights.text().strip() or None
+            args.darks = self.ed_darks.text().strip() or None
+            args.process = self.ed_process.text().strip() or "process"
+            args.calibrated = self.ed_calibrated.text().strip() or "calibrated"
+
+            args.mono = self.cmb_sensor.currentIndex() == 1
+            args.debayer = self.chk_debayer.isChecked() and not args.mono
+            args.cosmetic = self.chk_cosmetic.isChecked()
+            args.rejection = REJECTIONS[self.cmb_rejection.currentIndex()][1]
+
+            args.tiff_bits = int(self.cmb_bits.currentText())
+            args.astro = self.chk_astro.isChecked()
+            args.deflate = self.chk_deflate.isChecked()
+            args.name_from_raw = self.cmb_naming.currentIndex() == 1
+            args.tiff_basename = self.ed_basename.text().strip() or "light"
+            args.stretch = STRETCH_KEYS[self.cmb_stretch.currentIndex()]
+            return args
+
+        def _start(self) -> None:
+            if self.running:
+                return
+            args = self._collect()
+            if args is None:
+                return
+
+            self.running = True
+            self.btn_run.setEnabled(False)
+            self.progress.setValue(0)
+            self.text.clear()
+            self.lbl_status.setText("Processing...")
+
+            thread = threading.Thread(target=self._worker, args=(args,),
+                                      daemon=True)
+            thread.start()
+
+        def _worker(self, args) -> None:
+            """Runs off the GUI thread; every Siril command is issued here."""
+            try:
+                self.run_finished.emit(run_pipeline(self.siril, args), None)
+            except CalibrationError as exc:
+                self.run_finished.emit(0, str(exc))
+            except Exception as exc:
+                self.run_finished.emit(
+                    0, exc.__class__.__name__ + ": " + str(exc))
+
+        def _append_log(self, message, color=None) -> None:
+            colour = LOG_COLOURS[self.log_theme].get(
+                (color or "").lower() if color else "")
+            if colour:
+                self.text.appendHtml(
+                    '<span style="color:%s; white-space:pre">%s</span>'
+                    % (colour, html.escape(message)))
+            else:
+                self.text.appendPlainText(message)
+            if message.startswith("["):
+                self.lbl_status.setText(message)
+
+        def _finish(self, count, error) -> None:
+            self.running = False
+            self.btn_run.setEnabled(True)
+            if error:
+                self.lbl_status.setText("Processing failed.")
+                self.text.appendPlainText("ERROR: " + error)
+                QtWidgets.QMessageBox.critical(self, "Calibration failed",
+                                               error)
+                return
+            self.lbl_status.setText("Done - frames saved: " + str(count))
+            self.progress.setValue(100)
+            QtWidgets.QMessageBox.information(
+                self, "Done", "Frames calibrated and saved: " + str(count))
+
+        def closeEvent(self, event) -> None:
+            if self.running:
+                answer = QtWidgets.QMessageBox.question(
+                    self, "Processing is running",
+                    "Processing is still running. Close the window anyway?")
+                if answer != QtWidgets.QMessageBox.StandardButton.Yes:
+                    event.ignore()
+                    return
+            event.accept()
+
+
+def siril_is_dark(siril) -> bool:
+    """Siril's own light/dark preference (gui.theme: 0 dark, 1 light)."""
+    try:
+        return siril.get_siril_config("gui", "theme") == 0
+    except Exception:
+        return False
+
+
+def apply_siril_theme(app, siril) -> None:
+    """Match Qt to Siril's light/dark preference."""
+    if not siril_is_dark(siril):
+        return  # the light theme is Qt's default look
+
+    app.setStyle("Fusion")
+    palette = QtGui.QPalette()
+    role = QtGui.QPalette.ColorRole
+    window = QtGui.QColor(53, 53, 53)
+    base = QtGui.QColor(35, 35, 35)
+    text = QtGui.QColor(220, 220, 220)
+    for target, colour in ((role.Window, window), (role.Base, base),
+                           (role.AlternateBase, window), (role.Button, window),
+                           (role.ToolTipBase, window), (role.WindowText, text),
+                           (role.Text, text), (role.ButtonText, text),
+                           (role.ToolTipText, text),
+                           (role.Highlight, QtGui.QColor(42, 130, 218)),
+                           (role.HighlightedText, QtGui.QColor(0, 0, 0))):
+        palette.setColor(target, colour)
+    disabled = QtGui.QPalette.ColorGroup.Disabled
+    for target in (role.WindowText, role.Text, role.ButtonText):
+        palette.setColor(disabled, target, QtGui.QColor(127, 127, 127))
+    app.setPalette(palette)
 
 
 def launch_gui(siril, defaults) -> int:
     """Open the dialog; returns 0 (errors are reported inside the window)."""
-    root = build_root()
-    gui = CalibrationGUI(root, siril, defaults)
-    add_log_sink(gui.sink_log)
-    add_progress_sink(gui.sink_progress)
-    root.mainloop()
+    if QtWidgets is None:
+        raise CalibrationError(
+            "PyQt6 is not available in this Python environment.")
+
+    app = QtWidgets.QApplication.instance()
+    owns_app = app is None
+    if owns_app:
+        app = QtWidgets.QApplication(sys.argv[:1])
+    apply_siril_theme(app, siril)
+
+    window = CalibrationWindow(siril, defaults)
+    add_log_sink(window.sink_log)
+    add_progress_sink(window.sink_progress)
+    window.show()
+    window.raise_()
+    window.activateWindow()
+
+    if owns_app:
+        app.exec()
     return 0
 
 

@@ -48,6 +48,7 @@ Without arguments the GUI opens. Command line arguments pre-fill the form; with
 from __future__ import annotations
 
 import argparse
+import html
 import os
 import sys
 import threading
@@ -65,10 +66,17 @@ try:
 except ImportError:  # builds of sirilpy without LogColor
     LogColor = None
 
+# PyQt6 is the Qt binding that ships in Siril's own Python environment
+# (Siril 1.4 bundles PyQt6 6.11 / Qt 6.11). Kept tolerant so --no-gui still
+# works on an installation without it.
 try:
-    from sirilpy import tksiril  # matches the GUI to Siril's theme (1.4.x)
+    from PyQt6 import QtCore, QtGui, QtWidgets
 except ImportError:
-    tksiril = None
+    try:
+        s.ensure_installed("PyQt6")
+        from PyQt6 import QtCore, QtGui, QtWidgets
+    except Exception:
+        QtCore = QtGui = QtWidgets = None
 
 
 FITS_EXTS = (".fit", ".fits", ".fts")
@@ -94,6 +102,16 @@ USHORT_MAX = 65535.0
 # A float image whose maximum sits above this is taken to be stored in ADU
 # rather than in Siril's normalised [0, 1] range.
 ADU_THRESHOLD = 1.5
+
+
+# Siril's log colours, in a light and a dark variant so the embedded log stays
+# readable whichever theme Siril is set to.
+LOG_COLOURS = {
+    "light": {"green": "#1b6e2b", "salmon": "#b34a20", "blue": "#14539a",
+              "red": "#b3261e"},
+    "dark": {"green": "#7fd18c", "salmon": "#ffb08f", "blue": "#7cb6f2",
+             "red": "#ff9b94"},
+}
 
 
 class ConvertError(RuntimeError):
@@ -512,494 +530,523 @@ def run_pipeline(siril, args, cancel=None) -> tuple:
 
 
 # ---------------------------------------------------------------------------
-# GUI (tkinter + tksiril - the recommended approach for Siril 1.4.x)
+# GUI (PyQt6 - the Qt binding that ships in Siril's Python environment)
 # ---------------------------------------------------------------------------
 
-def build_root():
-    """The main window; uses the themed variant when ttkthemes is available."""
+if QtWidgets is not None:
+
+    class BitDepthWindow(QtWidgets.QWidget):
+        """Settings dialog; the conversion runs on its own thread.
+
+        The worker talks to the window through Qt signals, which Qt delivers on
+        the GUI thread, so no widget is ever touched from the wrong thread.
+        """
+
+        log_line = QtCore.pyqtSignal(str, object)
+        progress_changed = QtCore.pyqtSignal(int, int)
+        run_finished = QtCore.pyqtSignal(object, object)
+
+        def __init__(self, siril, defaults):
+            super().__init__()
+            self.siril = siril
+            self.running = False
+            self.cancel = threading.Event()
+            self.log_theme = "dark" if siril_is_dark(siril) else "light"
+
+            self.setWindowTitle("Convert the bit depth of FITS files")
+            self._build_widgets(defaults)
+
+            self.log_line.connect(self._append_log)
+            self.progress_changed.connect(self._on_progress)
+            self.run_finished.connect(self._finish)
+
+            self._refresh_sequences()
+            self._sync_source()
+            self._sync_target()
+            self._sync_output()
+            self._fit_to_screen()
+
+        # -- layout ---------------------------------------------------------
+
+        def _build_widgets(self, d) -> None:
+            outer = QtWidgets.QVBoxLayout(self)
+            outer.setContentsMargins(8, 8, 8, 8)
+
+            try:
+                wd = self.siril.get_siril_wd() or ""
+            except Exception:
+                wd = ""
+
+            # --- source ---
+            box = QtWidgets.QGroupBox("Files to convert")
+            grid = QtWidgets.QGridLayout(box)
+            self.ed_folder = self._dir_row(
+                grid, 0, "Folder:", d.folder or wd,
+                "Folder holding the FITS files, or the folder the sequence "
+                "lives in.")
+            self.ed_folder.editingFinished.connect(self._on_folder_change)
+
+            self.rb_folder = QtWidgets.QRadioButton(
+                "Every FITS file in the folder")
+            self.rb_sequence = QtWidgets.QRadioButton("One sequence:")
+            self.source_group = QtWidgets.QButtonGroup(self)
+            self.source_group.addButton(self.rb_folder)
+            self.source_group.addButton(self.rb_sequence)
+            (self.rb_sequence if d.sequence else self.rb_folder).setChecked(True)
+            self.rb_folder.toggled.connect(self._sync_source)
+            grid.addWidget(self.rb_folder, 1, 0, 1, 2)
+
+            self.chk_recursive = QtWidgets.QCheckBox("Include subfolders")
+            self.chk_recursive.setChecked(d.recursive)
+            self.chk_recursive.setToolTip(
+                "The folder structure is reproduced in the output folder.")
+            self.chk_recursive.toggled.connect(self._refresh_count)
+            indent = QtWidgets.QHBoxLayout()
+            indent.addSpacing(20)
+            indent.addWidget(self.chk_recursive)
+            indent.addStretch(1)
+            grid.addLayout(indent, 2, 0, 1, 3)
+
+            grid.addWidget(self.rb_sequence, 3, 0)
+            self.cmb_seq = QtWidgets.QComboBox()
+            self.cmb_seq.setEditable(True)
+            self.cmb_seq.setToolTip(
+                "Sequence name, e.g. 'light_'. The list holds the .seq files "
+                "found in the folder. Only sequences stored as one file per "
+                "frame can be converted, not SER or FITSEQ.")
+            self.cmb_seq.setCurrentText(clean_seq_name(d.sequence or ""))
+            self.cmb_seq.currentTextChanged.connect(self._refresh_count)
+            grid.addWidget(self.cmb_seq, 3, 1)
+            btn = QtWidgets.QPushButton("Refresh")
+            btn.clicked.connect(self._refresh_sequences)
+            grid.addWidget(btn, 3, 2)
+
+            self.chk_make_seq = QtWidgets.QCheckBox(
+                "Write a .seq for the converted sequence")
+            self.chk_make_seq.setChecked(d.make_seq)
+            self.chk_make_seq.setToolTip(
+                "Rewrites the .seq next to the results, so Siril picks the "
+                "converted frames up without a manual 'Search sequence'.")
+            indent = QtWidgets.QHBoxLayout()
+            indent.addSpacing(20)
+            indent.addWidget(self.chk_make_seq)
+            indent.addStretch(1)
+            grid.addLayout(indent, 4, 0, 1, 3)
+
+            self.lbl_count = QtWidgets.QLabel("No folder selected.")
+            self.lbl_count.setWordWrap(True)
+            grid.addWidget(self.lbl_count, 5, 0, 1, 3)
+            outer.addWidget(box)
+
+            # --- target ---
+            box = QtWidgets.QGroupBox("Convert to")
+            inner = QtWidgets.QVBoxLayout(box)
+            self.target_group = QtWidgets.QButtonGroup(self)
+            self.radios = {}
+            for key in (TARGET_16, TARGET_32):
+                radio = QtWidgets.QRadioButton(TARGET_LABELS[key])
+                radio.setChecked(d.target == key)
+                radio.toggled.connect(self._sync_target)
+                self.target_group.addButton(radio)
+                inner.addWidget(radio)
+                self.radios[key] = radio
+
+            self.lbl_warning = QtWidgets.QLabel("")
+            self.lbl_warning.setWordWrap(True)
+            inner.addWidget(self.lbl_warning)
+
+            self.chk_skip = QtWidgets.QCheckBox(
+                "Skip files that already have the target depth")
+            self.chk_skip.setChecked(d.skip_matching)
+            self.chk_skip.setToolTip(
+                "The depth is read from the BITPIX header of each file.")
+            inner.addWidget(self.chk_skip)
+
+            self.chk_rescale = QtWidgets.QCheckBox(
+                "Rescale the values between the two conventions")
+            self.chk_rescale.setChecked(d.rescale)
+            self.chk_rescale.setToolTip(
+                "Siril stores 16-bit data as 0 - 65535 and 32-bit data as "
+                "0.0 - 1.0. With this off the raw numbers are cast, which "
+                "changes how the image looks.")
+            inner.addWidget(self.chk_rescale)
+            outer.addWidget(box)
+
+            # --- output ---
+            box = QtWidgets.QGroupBox("Output")
+            grid = QtWidgets.QGridLayout(box)
+            self.chk_overwrite = QtWidgets.QCheckBox(
+                "Overwrite the original files")
+            self.chk_overwrite.setChecked(d.overwrite)
+            self.chk_overwrite.setToolTip(
+                "The originals are replaced. There is no undo.")
+            self.chk_overwrite.toggled.connect(self._sync_output)
+            grid.addWidget(self.chk_overwrite, 0, 0, 1, 3)
+            self.lbl_out = QtWidgets.QLabel("Save to:")
+            grid.addWidget(self.lbl_out, 1, 0)
+            self.ed_output = QtWidgets.QLineEdit(d.output or "")
+            grid.addWidget(self.ed_output, 1, 1)
+            self.btn_out = QtWidgets.QPushButton("...")
+            self.btn_out.setFixedWidth(32)
+            self.btn_out.clicked.connect(lambda: self._browse(self.ed_output))
+            grid.addWidget(self.btn_out, 1, 2)
+            grid.setColumnStretch(1, 1)
+            outer.addWidget(box)
+
+            outer.addWidget(self._log_box(), 1)
+
+            buttons = QtWidgets.QHBoxLayout()
+            buttons.addStretch(1)
+            btn = QtWidgets.QPushButton("Close")
+            btn.clicked.connect(self.close)
+            buttons.addWidget(btn)
+            self.btn_run = QtWidgets.QPushButton("Convert")
+            self.btn_run.setDefault(True)
+            self.btn_run.clicked.connect(self._start)
+            buttons.addWidget(self.btn_run)
+            outer.addLayout(buttons)
+
+        # -- the sinks the pipeline writes into ------------------------------
+
+        def sink_log(self, message, color) -> None:
+            self.log_line.emit(message, color)
+
+        def sink_progress(self, done, total) -> None:
+            self.progress_changed.emit(done, total)
+
+        # -- slots, all on the GUI thread ------------------------------------
+
+        def _append_log(self, message, color=None) -> None:
+            colour = LOG_COLOURS[self.log_theme].get(
+                (color or "").lower() if color else "")
+            if colour:
+                self.text.appendHtml(
+                    '<span style="color:%s; white-space:pre">%s</span>'
+                    % (colour, html.escape(message)))
+            else:
+                self.text.appendPlainText(message)
+
+        def _on_progress(self, done, total) -> None:
+            self.progress.setValue(int(100.0 * done / max(total, 1)))
+
+        def _fit_to_screen(self, min_w=560, min_h=400) -> None:
+            """Size the window to its content, never larger than the screen."""
+            available = QtGui.QGuiApplication.primaryScreen().availableGeometry()
+            hint = self.sizeHint()
+            width = min(max(hint.width(), min_w), int(available.width() * 0.92))
+            height = min(max(hint.height(), min_h), int(available.height() * 0.85))
+            self.setMinimumSize(min(min_w, width), min(min_h, height))
+            self.resize(width, height)
+            self.move(available.x() + (available.width() - width) // 2,
+                      available.y() + (available.height() - height) // 3)
+
+        def _error(self, message: str) -> None:
+            QtWidgets.QMessageBox.critical(self, "Error", message)
+
+        def _log_box(self, height=130):
+            """The progress group box every script ends with."""
+            box = QtWidgets.QGroupBox("Progress")
+            inner = QtWidgets.QVBoxLayout(box)
+            self.lbl_status = QtWidgets.QLabel("Ready.")
+            inner.addWidget(self.lbl_status)
+            self.progress = QtWidgets.QProgressBar()
+            self.progress.setRange(0, 100)
+            inner.addWidget(self.progress)
+            self.text = QtWidgets.QPlainTextEdit()
+            self.text.setReadOnly(True)
+            self.text.setLineWrapMode(QtWidgets.QPlainTextEdit.LineWrapMode.NoWrap)
+            self.text.setMinimumHeight(height)
+            inner.addWidget(self.text, 1)
+            return box
+
+        def _dir_row(self, grid, row, label, value, tip, browse=True):
+            grid.addWidget(QtWidgets.QLabel(label), row, 0)
+            edit = QtWidgets.QLineEdit(value)
+            edit.setToolTip(tip)
+            grid.addWidget(edit, row, 1)
+            if browse:
+                button = QtWidgets.QPushButton("...")
+                button.setFixedWidth(32)
+                button.clicked.connect(lambda _=False, e=edit: self._browse(e))
+                grid.addWidget(button, row, 2)
+            grid.setColumnStretch(1, 1)
+            return edit
+
+        # -- widget callbacks -----------------------------------------------
+
+        def _browse(self, edit) -> None:
+            start = edit.text().strip() or self.ed_folder.text().strip() \
+                or os.getcwd()
+            chosen = QtWidgets.QFileDialog.getExistingDirectory(
+                self, "Select a directory", start)
+            if chosen:
+                edit.setText(os.path.normpath(chosen))
+                if edit is self.ed_folder:
+                    self._on_folder_change()
+
+        def _folder(self):
+            text = self.ed_folder.text().strip()
+            folder = Path(text) if text else None
+            return folder if folder is not None and folder.is_dir() else None
+
+        def _on_folder_change(self) -> None:
+            self._refresh_sequences()
+            self._refresh_count()
+
+        def _refresh_sequences(self) -> None:
+            folder = self._folder()
+            names = list_sequences(folder) if folder else []
+            current = self.cmb_seq.currentText()
+            self.cmb_seq.blockSignals(True)
+            self.cmb_seq.clear()
+            self.cmb_seq.addItems(names)
+            self.cmb_seq.setCurrentText(
+                current or (names[0] if len(names) == 1 else ""))
+            self.cmb_seq.blockSignals(False)
+            self._refresh_count()
+
+        def _sync_source(self) -> None:
+            sequence = self.rb_sequence.isChecked()
+            self.chk_recursive.setEnabled(not sequence)
+            self.cmb_seq.setEnabled(sequence)
+            self.chk_make_seq.setEnabled(sequence)
+            self._refresh_count()
+
+        def _refresh_count(self) -> None:
+            folder = self._folder()
+            if folder is None:
+                self.lbl_count.setText("No folder selected.")
+                return
+            if self.rb_sequence.isChecked():
+                name = clean_seq_name(self.cmb_seq.currentText())
+                if not name:
+                    self.lbl_count.setText("No sequence selected.")
+                    return
+                frames = sequence_frames(folder, name)
+                if not frames:
+                    if (folder / (name + ".seq")).is_file():
+                        self.lbl_count.setText(
+                            "'" + name + "' has a .seq but no separate frames, "
+                            "so it is a SER or FITSEQ sequence - there is no "
+                            "per-frame file to convert.")
+                    else:
+                        self.lbl_count.setText(
+                            "No frame of '" + name + "' found here.")
+                    return
+                self.lbl_count.setText("%d frame(s) in the sequence."
+                                       % len(frames))
+                return
+            self.lbl_count.setText(
+                "%d FITS file(s) found."
+                % len(list_fits(folder, self.chk_recursive.isChecked())))
+
+        def _target(self) -> str:
+            return TARGET_16 if self.radios[TARGET_16].isChecked() else TARGET_32
+
+        def _sync_target(self) -> None:
+            if self._target() == TARGET_16:
+                self.lbl_warning.setText(
+                    "Lossy: float values are rounded to whole steps and "
+                    "anything outside the range is clipped. Clipped pixels are "
+                    "counted and reported per file.")
+            else:
+                self.lbl_warning.setText(
+                    "Lossless, but it does not bring back precision that an "
+                    "earlier 16-bit conversion already threw away. The files "
+                    "become twice as large.")
+
+        def _sync_output(self) -> None:
+            on = not self.chk_overwrite.isChecked()
+            self.ed_output.setEnabled(on)
+            self.btn_out.setEnabled(on)
+            self.lbl_out.setEnabled(on)
+
+        # -- starting the work ----------------------------------------------
+
+        def _collect(self):
+            """Build the same settings object argparse produces, from the form."""
+            folder = self._folder()
+            if folder is None:
+                self._error("The source folder does not exist.")
+                return None
+
+            sequence = None
+            if self.rb_sequence.isChecked():
+                sequence = clean_seq_name(self.cmb_seq.currentText())
+                if not sequence:
+                    self._error("Choose a sequence.")
+                    return None
+                files = sequence_frames(folder, sequence)
+                if not files:
+                    self._error(
+                        "No frame of the sequence '" + sequence + "' was "
+                        "found.\n\nSER and FITSEQ sequences keep every frame in "
+                        "one container and cannot be converted frame by frame.")
+                    return None
+            else:
+                files = list_fits(folder, self.chk_recursive.isChecked())
+                if not files:
+                    self._error("No FITS file was found there.")
+                    return None
+
+            overwrite = self.chk_overwrite.isChecked()
+            output = self.ed_output.text().strip()
+            if not overwrite:
+                if not output:
+                    self._error(
+                        "Choose an output folder, or enable overwriting.")
+                    return None
+                if Path(output).resolve() == folder.resolve():
+                    self._error("The output folder is the same as the source "
+                                "folder.")
+                    return None
+
+            args = parse_args([])
+            args.folder = str(folder)
+            args.sequence = sequence
+            args.recursive = self.chk_recursive.isChecked()
+            args.make_seq = self.chk_make_seq.isChecked()
+            args.target = self._target()
+            args.skip_matching = self.chk_skip.isChecked()
+            args.rescale = self.chk_rescale.isChecked()
+            args.overwrite = overwrite
+            args.output = output or None
+
+            label = TARGETS[args.target][2]
+            question = ("Convert %d %s to %s?\n\nOutput: %s"
+                        % (len(files),
+                           "frame(s) of '" + sequence + "'" if sequence
+                           else "file(s)", label,
+                           "the originals will be overwritten" if overwrite
+                           else output))
+            if args.target == TARGET_16:
+                question += ("\n\nThis is lossy - values outside the range are "
+                             "clipped and cannot be recovered.")
+            answer = QtWidgets.QMessageBox.question(self, "Convert", question)
+            if answer != QtWidgets.QMessageBox.StandardButton.Yes:
+                return None
+            return args
+
+        def _start(self) -> None:
+            if self.running:
+                return
+            args = self._collect()
+            if args is None:
+                return
+
+            self.running = True
+            self.cancel.clear()
+            self.btn_run.setEnabled(False)
+            self.progress.setValue(0)
+            self.text.clear()
+            self.lbl_status.setText("Converting...")
+
+            thread = threading.Thread(target=self._worker, args=(args,),
+                                      daemon=True)
+            thread.start()
+
+        def _worker(self, args) -> None:
+            """Runs off the GUI thread; every Siril call is issued from here."""
+            try:
+                self.run_finished.emit(
+                    run_pipeline(self.siril, args, self.cancel), None)
+            except ConvertError as exc:
+                self.run_finished.emit(None, str(exc))
+            except Exception as exc:
+                self.run_finished.emit(
+                    None, exc.__class__.__name__ + ": " + str(exc))
+
+        def _on_progress(self, done, total) -> None:
+            self.progress.setValue(int(100.0 * done / max(total, 1)))
+            self.lbl_status.setText("Converting... %d/%d" % (done, total))
+
+        def _finish(self, result, error) -> None:
+            self.running = False
+            self.btn_run.setEnabled(True)
+            if error:
+                self.lbl_status.setText("Conversion failed.")
+                self.text.appendPlainText("ERROR: " + error)
+                QtWidgets.QMessageBox.critical(self, "Conversion failed", error)
+                return
+
+            converted, skipped, failed = result
+            message = ("%d converted, %d skipped, %d failed."
+                       % (converted, skipped, failed))
+            self.lbl_status.setText(message)
+            self.progress.setValue(100)
+            self._refresh_count()
+            if failed:
+                QtWidgets.QMessageBox.warning(
+                    self, "Finished", message + "\nSee the log for details.")
+            else:
+                QtWidgets.QMessageBox.information(self, "Finished", message)
+
+        def closeEvent(self, event) -> None:
+            if self.running:
+                answer = QtWidgets.QMessageBox.question(
+                    self, "Conversion is running",
+                    "A conversion is still running. Close the window anyway?")
+                if answer != QtWidgets.QMessageBox.StandardButton.Yes:
+                    event.ignore()
+                    return
+                self.cancel.set()
+            event.accept()
+
+
+def siril_is_dark(siril) -> bool:
+    """Siril's own light/dark preference (gui.theme: 0 dark, 1 light)."""
     try:
-        s.ensure_installed("ttkthemes")
-        from ttkthemes import ThemedTk
-        return ThemedTk()
+        return siril.get_siril_config("gui", "theme") == 0
     except Exception:
-        import tkinter as tk
-        return tk.Tk()
+        return False
 
 
-class BitDepthGUI:
-    """Settings dialog; the conversion runs on its own thread."""
+def apply_siril_theme(app, siril) -> None:
+    """Match Qt to Siril's light/dark preference."""
+    if not siril_is_dark(siril):
+        return  # the light theme is Qt's default look
 
-    def __init__(self, root, siril, defaults):
-        import queue
-        import tkinter as tk
-        from tkinter import ttk
-
-        self.tk = tk
-        self.ttk = ttk
-        self.root = root
-        self.siril = siril
-        self.queue = queue.Queue()
-        self.running = False
-        self.alive = True
-        self.pump_id = None
-        self.cancel = threading.Event()
-
-        root.title("Convert the bit depth of FITS files")
-        root.minsize(720, 640)
-
-        if tksiril is not None:
-            try:
-                self.style = tksiril.standard_style()
-                tksiril.match_theme_to_siril(root, siril)
-            except Exception:
-                self.style = ttk.Style()
-        else:
-            self.style = ttk.Style()
-
-        try:
-            wd = siril.get_siril_wd() or ""
-        except Exception:
-            wd = ""
-
-        d = defaults
-        self.var_folder = tk.StringVar(value=d.folder or wd)
-        self.var_source = tk.StringVar(
-            value=SOURCE_SEQUENCE if d.sequence else SOURCE_FOLDER)
-        self.var_sequence = tk.StringVar(value=clean_seq_name(d.sequence or ""))
-        self.var_make_seq = tk.BooleanVar(value=d.make_seq)
-        self.var_recursive = tk.BooleanVar(value=d.recursive)
-        self.var_target = tk.StringVar(value=d.target)
-        self.var_skip = tk.BooleanVar(value=d.skip_matching)
-        self.var_rescale = tk.BooleanVar(value=d.rescale)
-        self.var_overwrite = tk.BooleanVar(value=d.overwrite)
-        self.var_output = tk.StringVar(value=d.output or "")
-        self.var_count = tk.StringVar(value="No folder selected.")
-        self.var_status = tk.StringVar(value="Ready.")
-
-        self._build_widgets()
-        self.var_folder.trace_add("write", lambda *_a: self._on_folder_change())
-        self.var_sequence.trace_add("write", lambda *_a: self._refresh_count())
-        self._refresh_sequences()
-        self._sync_source()
-        self._sync_output()
-        self.pump_id = self.root.after(100, self._pump)
-        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
-
-    # -- layout -------------------------------------------------------------
-
-    def _build_widgets(self) -> None:
-        ttk, tk = self.ttk, self.tk
-        from tkinter import scrolledtext
-
-        main = ttk.Frame(self.root, padding=10)
-        main.pack(fill="both", expand=True)
-        main.columnconfigure(0, weight=1)
-
-        # --- source ---
-        box = ttk.LabelFrame(main, text="Files to convert", padding=8)
-        box.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-        box.columnconfigure(1, weight=1)
-
-        ttk.Label(box, text="Folder:").grid(row=0, column=0, sticky="w", pady=2)
-        entry = ttk.Entry(box, textvariable=self.var_folder)
-        entry.grid(row=0, column=1, sticky="ew", padx=6, pady=2)
-        self._tip(entry, "Folder holding the FITS files, or the folder the "
-                         "sequence lives in.")
-        ttk.Button(box, text="...", width=3,
-                   command=lambda: self._browse(self.var_folder)).grid(
-                       row=0, column=2, pady=2)
-
-        radio = ttk.Radiobutton(box, text="Every FITS file in the folder",
-                                variable=self.var_source, value=SOURCE_FOLDER,
-                                command=self._sync_source)
-        radio.grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
-
-        self.chk_recursive = ttk.Checkbutton(box, text="Include subfolders",
-                                             variable=self.var_recursive,
-                                             command=self._refresh_count)
-        self.chk_recursive.grid(row=2, column=1, sticky="w", padx=(20, 0))
-        self._tip(self.chk_recursive,
-                  "The folder structure is reproduced in the output folder.")
-
-        radio = ttk.Radiobutton(box, text="One sequence:",
-                                variable=self.var_source, value=SOURCE_SEQUENCE,
-                                command=self._sync_source)
-        radio.grid(row=3, column=0, sticky="w", pady=(6, 0))
-
-        self.cmb_seq = ttk.Combobox(box, textvariable=self.var_sequence)
-        self.cmb_seq.grid(row=3, column=1, sticky="ew", padx=6, pady=(6, 0))
-        self._tip(self.cmb_seq,
-                  "Sequence name, e.g. 'light_'. The list holds the .seq files "
-                  "found in the folder. Only sequences stored as one file per "
-                  "frame can be converted, not SER or FITSEQ.")
-        ttk.Button(box, text="Refresh", command=self._refresh_sequences).grid(
-            row=3, column=2, pady=(6, 0))
-
-        self.chk_make_seq = ttk.Checkbutton(
-            box, text="Write a .seq for the converted sequence",
-            variable=self.var_make_seq)
-        self.chk_make_seq.grid(row=4, column=1, sticky="w", padx=(20, 0))
-        self._tip(self.chk_make_seq,
-                  "Rewrites the .seq next to the results, so Siril picks the "
-                  "converted frames up without a manual 'Search sequence'.")
-
-        ttk.Label(box, textvariable=self.var_count).grid(
-            row=5, column=1, sticky="w", padx=6, pady=(6, 0))
-
-        # --- target ---
-        box = ttk.LabelFrame(main, text="Convert to", padding=8)
-        box.grid(row=1, column=0, sticky="ew", pady=(0, 8))
-        box.columnconfigure(1, weight=1)
-
-        for row, key in enumerate((TARGET_16, TARGET_32)):
-            radio = ttk.Radiobutton(box, text=TARGET_LABELS[key],
-                                    variable=self.var_target, value=key,
-                                    command=self._sync_target)
-            radio.grid(row=row, column=0, columnspan=2, sticky="w", pady=2)
-
-        self.lbl_warning = ttk.Label(box, text="", wraplength=640,
-                                     justify="left")
-        self.lbl_warning.grid(row=2, column=0, columnspan=2, sticky="w",
-                              pady=(4, 0))
-
-        chk = ttk.Checkbutton(
-            box, text="Skip files that already have the target depth",
-            variable=self.var_skip)
-        chk.grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
-        self._tip(chk, "The depth is read from the BITPIX header of each file.")
-
-        chk = ttk.Checkbutton(
-            box, text="Rescale the values between the two conventions",
-            variable=self.var_rescale)
-        chk.grid(row=4, column=0, columnspan=2, sticky="w", pady=2)
-        self._tip(chk, "Siril stores 16-bit data as 0 - 65535 and 32-bit data "
-                       "as 0.0 - 1.0. With this off the raw numbers are cast, "
-                       "which changes how the image looks.")
-
-        # --- output ---
-        box = ttk.LabelFrame(main, text="Output", padding=8)
-        box.grid(row=2, column=0, sticky="ew", pady=(0, 8))
-        box.columnconfigure(1, weight=1)
-
-        chk = ttk.Checkbutton(box, text="Overwrite the original files",
-                              variable=self.var_overwrite,
-                              command=self._sync_output)
-        chk.grid(row=0, column=0, columnspan=3, sticky="w")
-        self._tip(chk, "The originals are replaced. There is no undo.")
-
-        self.lbl_out = ttk.Label(box, text="Save to:")
-        self.lbl_out.grid(row=1, column=0, sticky="w", pady=(6, 0))
-        self.ent_out = ttk.Entry(box, textvariable=self.var_output)
-        self.ent_out.grid(row=1, column=1, sticky="ew", padx=6, pady=(6, 0))
-        self.btn_out = ttk.Button(box, text="...", width=3,
-                                  command=lambda: self._browse(self.var_output))
-        self.btn_out.grid(row=1, column=2, pady=(6, 0))
-
-        # --- progress ---
-        box = ttk.LabelFrame(main, text="Progress", padding=8)
-        box.grid(row=3, column=0, sticky="nsew")
-        box.columnconfigure(0, weight=1)
-        box.rowconfigure(2, weight=1)
-        main.rowconfigure(3, weight=1)
-
-        ttk.Label(box, textvariable=self.var_status).grid(row=0, column=0,
-                                                          sticky="w")
-        self.progress = ttk.Progressbar(box, mode="determinate", maximum=100)
-        self.progress.grid(row=1, column=0, sticky="ew", pady=(4, 6))
-        self.text = scrolledtext.ScrolledText(box, height=12, wrap="none")
-        self.text.grid(row=2, column=0, sticky="nsew")
-        self.text.configure(state="disabled")
-
-        # --- buttons ---
-        buttons = ttk.Frame(main, padding=(0, 8, 0, 0))
-        buttons.grid(row=4, column=0, sticky="ew")
-        self.btn_run = ttk.Button(buttons, text="Convert", command=self._start)
-        self.btn_run.pack(side="right")
-        ttk.Button(buttons, text="Close", command=self._on_close).pack(
-            side="right", padx=(0, 6))
-
-        self._sync_target()
-
-    def _tip(self, widget, text) -> None:
-        if tksiril is not None:
-            try:
-                tksiril.create_tooltip(widget, text)
-            except Exception:
-                pass
-
-    # -- widget callbacks ---------------------------------------------------
-
-    def _browse(self, var) -> None:
-        from tkinter import filedialog
-        initial = var.get() or self.var_folder.get() or os.getcwd()
-        chosen = filedialog.askdirectory(initialdir=initial, parent=self.root)
-        if chosen:
-            var.set(os.path.normpath(chosen))
-
-    def _folder(self):
-        text = self.var_folder.get().strip()
-        folder = Path(text) if text else None
-        return folder if folder is not None and folder.is_dir() else None
-
-    def _on_folder_change(self) -> None:
-        self._refresh_sequences()
-        self._refresh_count()
-
-    def _refresh_sequences(self) -> None:
-        folder = self._folder()
-        names = list_sequences(folder) if folder else []
-        self.cmb_seq.configure(values=names)
-        if not self.var_sequence.get() and len(names) == 1:
-            self.var_sequence.set(names[0])
-        self._refresh_count()
-
-    def _sync_source(self) -> None:
-        """Only the controls of the chosen input mode stay usable."""
-        sequence = self.var_source.get() == SOURCE_SEQUENCE
-        self.chk_recursive.state(["disabled"] if sequence else ["!disabled"])
-        self.cmb_seq.configure(state="normal" if sequence else "disabled")
-        self.chk_make_seq.state(["!disabled"] if sequence else ["disabled"])
-        self._refresh_count()
-
-    def _refresh_count(self) -> None:
-        folder = self._folder()
-        if folder is None:
-            self.var_count.set("No folder selected.")
-            return
-        if self.var_source.get() == SOURCE_SEQUENCE:
-            name = clean_seq_name(self.var_sequence.get())
-            if not name:
-                self.var_count.set("No sequence selected.")
-                return
-            frames = sequence_frames(folder, name)
-            if not frames:
-                if (folder / (name + ".seq")).is_file():
-                    self.var_count.set(
-                        "'" + name + "' has a .seq but no separate frames, so "
-                        "it is a SER or FITSEQ sequence - there is no per-frame "
-                        "file to convert.")
-                else:
-                    self.var_count.set("No frame of '" + name + "' found here.")
-                return
-            self.var_count.set("%d frame(s) in the sequence." % len(frames))
-            return
-        self.var_count.set("%d FITS file(s) found."
-                           % len(list_fits(folder, self.var_recursive.get())))
-
-    def _sync_target(self) -> None:
-        if self.var_target.get() == TARGET_16:
-            self.lbl_warning.configure(
-                text="Lossy: float values are rounded to whole steps and "
-                     "anything outside the range is clipped. Clipped pixels are "
-                     "counted and reported per file.")
-        else:
-            self.lbl_warning.configure(
-                text="Lossless, but it does not bring back precision that an "
-                     "earlier 16-bit conversion already threw away. The files "
-                     "become twice as large.")
-
-    def _sync_output(self) -> None:
-        state = "disabled" if self.var_overwrite.get() else "normal"
-        self.ent_out.configure(state=state)
-        self.btn_out.configure(state=state)
-        self.lbl_out.configure(state=state)
-
-    # -- starting the work --------------------------------------------------
-
-    def _collect(self):
-        """Build the same settings object argparse produces, from the form."""
-        from tkinter import messagebox
-
-        folder = self._folder()
-        if folder is None:
-            messagebox.showerror("Error", "The source folder does not exist.",
-                                 parent=self.root)
-            return None
-
-        sequence = None
-        if self.var_source.get() == SOURCE_SEQUENCE:
-            sequence = clean_seq_name(self.var_sequence.get())
-            if not sequence:
-                messagebox.showerror("Error", "Choose a sequence.",
-                                     parent=self.root)
-                return None
-            files = sequence_frames(folder, sequence)
-            if not files:
-                messagebox.showerror(
-                    "Error",
-                    "No frame of the sequence '" + sequence + "' was found.\n\n"
-                    "SER and FITSEQ sequences keep every frame in one container "
-                    "and cannot be converted frame by frame.", parent=self.root)
-                return None
-        else:
-            files = list_fits(folder, self.var_recursive.get())
-            if not files:
-                messagebox.showerror("Error", "No FITS file was found there.",
-                                     parent=self.root)
-                return None
-
-        overwrite = self.var_overwrite.get()
-        output = self.var_output.get().strip()
-        if not overwrite:
-            if not output:
-                messagebox.showerror(
-                    "Error", "Choose an output folder, or enable overwriting.",
-                    parent=self.root)
-                return None
-            if Path(output).resolve() == folder.resolve():
-                messagebox.showerror(
-                    "Error", "The output folder is the same as the source "
-                             "folder.", parent=self.root)
-                return None
-
-        args = parse_args([])
-        args.folder = str(folder)
-        args.sequence = sequence
-        args.recursive = self.var_recursive.get()
-        args.make_seq = self.var_make_seq.get()
-        args.target = self.var_target.get()
-        args.skip_matching = self.var_skip.get()
-        args.rescale = self.var_rescale.get()
-        args.overwrite = overwrite
-        args.output = output or None
-
-        label = TARGETS[args.target][2]
-        question = ("Convert %d %s to %s?\n\nOutput: %s"
-                    % (len(files),
-                       "frame(s) of '" + sequence + "'" if sequence
-                       else "file(s)",
-                       label,
-                       "the originals will be overwritten" if overwrite
-                       else output))
-        if args.target == TARGET_16:
-            question += ("\n\nThis is lossy - values outside the range are "
-                         "clipped and cannot be recovered.")
-        if not messagebox.askokcancel("Convert", question, parent=self.root):
-            return None
-        return args
-
-    def _start(self) -> None:
-        if self.running:
-            return
-        args = self._collect()
-        if args is None:
-            return
-
-        self.running = True
-        self.cancel.clear()
-        self.btn_run.state(["disabled"])
-        self.progress.configure(value=0)
-        self._clear_log()
-        self.var_status.set("Converting...")
-
-        thread = threading.Thread(target=self._worker, args=(args,), daemon=True)
-        thread.start()
-
-    def _worker(self, args) -> None:
-        """Runs off the GUI thread; every Siril call is issued from here."""
-        try:
-            result = run_pipeline(self.siril, args, self.cancel)
-            self.queue.put(("done", result, None))
-        except ConvertError as exc:
-            self.queue.put(("done", None, str(exc)))
-        except Exception as exc:
-            self.queue.put(("done", None,
-                            exc.__class__.__name__ + ": " + str(exc)))
-
-    # -- passing messages from the worker thread to the GUI -----------------
-
-    def sink_log(self, message, color) -> None:
-        self.queue.put(("log", message, color))
-
-    def sink_progress(self, done, total) -> None:
-        self.queue.put(("progress", done, total))
-
-    def _pump(self) -> None:
-        import queue as queue_mod
-        if not self.alive:
-            return
-        try:
-            while True:
-                item = self.queue.get_nowait()
-                kind = item[0]
-                if kind == "log":
-                    self._append_log(item[1])
-                elif kind == "progress":
-                    done, total = item[1], item[2]
-                    self.progress.configure(value=100.0 * done / max(total, 1))
-                    self.var_status.set("Converting... %d/%d" % (done, total))
-                elif kind == "done":
-                    self._finish(item[1], item[2])
-        except queue_mod.Empty:
-            pass
-        self.pump_id = self.root.after(100, self._pump)
-
-    def _append_log(self, message) -> None:
-        self.text.configure(state="normal")
-        self.text.insert("end", message + "\n")
-        self.text.see("end")
-        self.text.configure(state="disabled")
-
-    def _clear_log(self) -> None:
-        self.text.configure(state="normal")
-        self.text.delete("1.0", "end")
-        self.text.configure(state="disabled")
-
-    def _finish(self, result, error) -> None:
-        from tkinter import messagebox
-        self.running = False
-        self.btn_run.state(["!disabled"])
-        if error:
-            self.var_status.set("Conversion failed.")
-            self._append_log("ERROR: " + error)
-            messagebox.showerror("Conversion failed", error, parent=self.root)
-            return
-
-        converted, skipped, failed = result
-        message = ("%d converted, %d skipped, %d failed."
-                   % (converted, skipped, failed))
-        self.var_status.set(message)
-        self.progress.configure(value=100)
-        self._refresh_count()
-        if failed:
-            messagebox.showwarning("Finished", message
-                                   + "\nSee the log for details.",
-                                   parent=self.root)
-        else:
-            messagebox.showinfo("Finished", message, parent=self.root)
-
-    def _on_close(self) -> None:
-        from tkinter import messagebox
-        if self.running:
-            if not messagebox.askyesno(
-                    "Conversion is running",
-                    "A conversion is still running. Close the window anyway?",
-                    parent=self.root):
-                return
-            self.cancel.set()
-        # stop the queue pump first, otherwise the pending callback fires
-        # after the window is gone and Tcl reports an invalid command
-        self.alive = False
-        if self.pump_id is not None:
-            try:
-                self.root.after_cancel(self.pump_id)
-            except Exception:
-                pass
-        self.root.destroy()
+    app.setStyle("Fusion")
+    palette = QtGui.QPalette()
+    role = QtGui.QPalette.ColorRole
+    window = QtGui.QColor(53, 53, 53)
+    base = QtGui.QColor(35, 35, 35)
+    text = QtGui.QColor(220, 220, 220)
+    for target, colour in ((role.Window, window), (role.Base, base),
+                           (role.AlternateBase, window), (role.Button, window),
+                           (role.ToolTipBase, window), (role.WindowText, text),
+                           (role.Text, text), (role.ButtonText, text),
+                           (role.ToolTipText, text),
+                           (role.Highlight, QtGui.QColor(42, 130, 218)),
+                           (role.HighlightedText, QtGui.QColor(0, 0, 0))):
+        palette.setColor(target, colour)
+    disabled = QtGui.QPalette.ColorGroup.Disabled
+    for target in (role.WindowText, role.Text, role.ButtonText):
+        palette.setColor(disabled, target, QtGui.QColor(127, 127, 127))
+    app.setPalette(palette)
 
 
 def launch_gui(siril, defaults) -> int:
     """Open the dialog; returns 0 (errors are reported inside the window)."""
-    root = build_root()
-    gui = BitDepthGUI(root, siril, defaults)
-    add_log_sink(gui.sink_log)
-    add_progress_sink(gui.sink_progress)
-    try:
-        if tksiril is not None:
-            tksiril.elevate(root)
-    except Exception:
-        pass
-    root.mainloop()
+    if QtWidgets is None:
+        raise ConvertError(
+            "PyQt6 is not available in this Python environment.")
+
+    app = QtWidgets.QApplication.instance()
+    owns_app = app is None
+    if owns_app:
+        app = QtWidgets.QApplication(sys.argv[:1])
+    apply_siril_theme(app, siril)
+
+    window = BitDepthWindow(siril, defaults)
+    add_log_sink(window.sink_log)
+    add_progress_sink(window.sink_progress)
+    window.show()
+    window.raise_()
+    window.activateWindow()
+
+    if owns_app:
+        app.exec()
     return 0
 
 

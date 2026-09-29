@@ -11,19 +11,31 @@ Requires Siril >= 1.4 with the Python (sirilpy) interface.
 Copy this file into your Siril scripts directory to get it in the script menu.
 """
 
+import html
 import os
 import re
-import queue
+import sys
 import threading
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
 
 import sirilpy as s
 
-s.ensure_installed("ttkthemes")
+# PyQt6 is the Qt binding that ships in Siril's own Python environment
+# (Siril 1.4 bundles PyQt6 6.11 / Qt 6.11).
+try:
+    from PyQt6 import QtCore, QtGui, QtWidgets   # noqa: E402
+except ImportError:
+    s.ensure_installed("PyQt6")
+    from PyQt6 import QtCore, QtGui, QtWidgets   # noqa: E402
 
-from ttkthemes import ThemedTk           # noqa: E402
-from sirilpy import tksiril              # noqa: E402
+
+# Siril's log colours, in a light and a dark variant so the embedded log stays
+# readable whichever theme Siril is set to.
+LOG_COLOURS = {
+    "light": {"green": "#1b6e2b", "salmon": "#b34a20", "blue": "#14539a",
+              "red": "#b3261e"},
+    "dark": {"green": "#7fd18c", "salmon": "#ffb08f", "blue": "#7cb6f2",
+             "red": "#ff9b94"},
+}
 
 
 # --------------------------------------------------------------------------- #
@@ -333,22 +345,60 @@ def save_command(out_base, ext):
 #  One row of the change list
 # --------------------------------------------------------------------------- #
 
-class ChangeRow:
+# ---------------------------------------------------------------------------
+# GUI (PyQt6 - the Qt binding that ships in Siril's Python environment)
+# ---------------------------------------------------------------------------
 
-    def __init__(self, parent, number, text, command, level, note,
-                 pre_existing):
+def siril_is_dark(siril) -> bool:
+    """Siril's own light/dark preference (gui.theme: 0 dark, 1 light)."""
+    try:
+        return siril.get_siril_config("gui", "theme") == 0
+    except Exception:
+        return False
+
+
+def apply_siril_theme(app, siril) -> None:
+    """Match Qt to Siril's light/dark preference."""
+    if not siril_is_dark(siril):
+        return  # the light theme is Qt's default look
+
+    app.setStyle("Fusion")
+    palette = QtGui.QPalette()
+    role = QtGui.QPalette.ColorRole
+    window = QtGui.QColor(53, 53, 53)
+    base = QtGui.QColor(35, 35, 35)
+    text = QtGui.QColor(220, 220, 220)
+    for target, colour in ((role.Window, window), (role.Base, base),
+                           (role.AlternateBase, window), (role.Button, window),
+                           (role.ToolTipBase, window), (role.WindowText, text),
+                           (role.Text, text), (role.ButtonText, text),
+                           (role.ToolTipText, text),
+                           (role.Highlight, QtGui.QColor(42, 130, 218)),
+                           (role.HighlightedText, QtGui.QColor(0, 0, 0))):
+        palette.setColor(target, colour)
+    disabled = QtGui.QPalette.ColorGroup.Disabled
+    for target in (role.WindowText, role.Text, role.ButtonText):
+        palette.setColor(disabled, target, QtGui.QColor(127, 127, 127))
+    app.setPalette(palette)
+
+
+class ChangeRow(QtWidgets.QWidget):
+    """One history entry: a checkbox, the entry text, and its command."""
+
+    def __init__(self, number, text, command, level, note, pre_existing):
+        super().__init__()
         self.level = level
         self.note = note
         self.pre_existing = pre_existing
 
-        self.frame = ttk.Frame(parent)
-        self.frame.columnconfigure(1, weight=1)
+        layout = QtWidgets.QGridLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setVerticalSpacing(2)
 
-        self.enabled = tk.BooleanVar(value=bool(command) and not pre_existing)
-        self.command = tk.StringVar(value=command)
-
-        self.check = ttk.Checkbutton(self.frame, variable=self.enabled)
-        self.check.grid(row=0, column=0, rowspan=2, sticky="n", padx=(0, 4))
+        self.check = QtWidgets.QCheckBox()
+        self.check.setChecked(bool(command) and not pre_existing)
+        layout.addWidget(self.check, 0, 0, 2, 1,
+                         QtCore.Qt.AlignmentFlag.AlignTop)
 
         if pre_existing:
             tag = "   [already stored in the file]"
@@ -358,189 +408,221 @@ class ChangeRow:
             tag = "   [no command]"
         else:
             tag = ""
+        label = QtWidgets.QLabel("%d. %s%s" % (number, text, tag))
+        label.setWordWrap(True)
+        layout.addWidget(label, 0, 1)
 
-        ttk.Label(self.frame, text="%d. %s%s" % (number, text, tag),
-                  wraplength=560, justify="left").grid(
-                      row=0, column=1, sticky="w")
-
-        row = ttk.Frame(self.frame)
-        row.grid(row=1, column=1, sticky="ew", pady=(2, 0))
-        row.columnconfigure(1, weight=1)
-        ttk.Label(row, text="command:").grid(row=0, column=0, padx=(0, 4))
-        self.entry = ttk.Entry(row, textvariable=self.command)
-        self.entry.grid(row=0, column=1, sticky="ew")
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(QtWidgets.QLabel("command:"))
+        self.entry = QtWidgets.QLineEdit(command)
+        self.entry.textChanged.connect(self._on_command_change)
+        row.addWidget(self.entry, 1)
+        layout.addLayout(row, 1, 1)
 
         if note:
-            ttk.Label(self.frame, text=note, wraplength=560,
-                      justify="left").grid(row=2, column=1, sticky="w")
+            hint = QtWidgets.QLabel(note)
+            hint.setWordWrap(True)
+            layout.addWidget(hint, 2, 1)
 
-        ttk.Separator(self.frame, orient="horizontal").grid(
-            row=3, column=0, columnspan=2, sticky="ew", pady=6)
+        line = QtWidgets.QFrame()
+        line.setFrameShape(QtWidgets.QFrame.Shape.HLine)
+        line.setFrameShadow(QtWidgets.QFrame.Shadow.Sunken)
+        layout.addWidget(line, 3, 0, 1, 2)
+        layout.setColumnStretch(1, 1)
 
-        self.command.trace_add("write", self._on_command_change)
         self._on_command_change()
 
-    def _on_command_change(self, *_args):
-        if self.command.get().strip():
-            self.check.state(["!disabled"])
+    def _on_command_change(self, *_args) -> None:
+        if self.entry.text().strip():
+            self.check.setEnabled(True)
         else:
-            self.enabled.set(False)
-            self.check.state(["disabled"])
+            self.check.setChecked(False)
+            self.check.setEnabled(False)
 
-    def pack(self, **kwargs):
-        self.frame.pack(**kwargs)
+    def command(self) -> str:
+        return self.entry.text().strip()
 
-    def is_active(self):
-        return self.enabled.get() and bool(self.command.get().strip())
+    def set_enabled(self, value: bool) -> None:
+        if value and not self.command():
+            return
+        self.check.setChecked(value)
+
+    def is_active(self) -> bool:
+        return self.check.isChecked() and bool(self.command())
 
 
-# --------------------------------------------------------------------------- #
-#  Main window
-# --------------------------------------------------------------------------- #
+class SirilSyncWindow(QtWidgets.QWidget):
+    """Main window; the sync runs on its own thread.
 
-class SirilSync:
+    The worker reports back through Qt signals, which Qt delivers on the GUI
+    thread, so no widget is touched from the wrong thread.
+    """
 
-    def __init__(self, root, siril):
-        self.root = root
+    log_line = QtCore.pyqtSignal(str, object)
+    status_changed = QtCore.pyqtSignal(str)
+    progress_max = QtCore.pyqtSignal(int)
+    progress_changed = QtCore.pyqtSignal(int)
+    run_finished = QtCore.pyqtSignal(int, int)
+
+    def __init__(self, siril):
+        super().__init__()
         self.siril = siril
         self.rows = []
         self.source_path = None
-        self.messages = queue.Queue()
         self.worker = None
         self.cancel = threading.Event()
+        self.log_theme = "dark" if siril_is_dark(siril) else "light"
 
-        root.title("SirilSync")
-        root.minsize(760, 640)
+        self.setWindowTitle("SirilSync")
+        self._build_widgets()
 
-        outer = ttk.Frame(root, padding=10)
-        outer.pack(fill="both", expand=True)
-
-        self.source_label = ttk.Label(outer, text="", wraplength=700,
-                                      justify="left")
-        self.source_label.pack(fill="x", pady=(0, 8))
-
-        self._build_target(outer)
-        self._build_changes(outer)
-        self._build_output(outer)
-        self._build_status(outer)
-        self._build_buttons(outer)
+        self.log_line.connect(self._append_log)
+        self.status_changed.connect(self.status.setText)
+        self.progress_max.connect(self._set_maximum)
+        self.progress_changed.connect(self.progress.setValue)
+        self.run_finished.connect(self.on_worker_finished)
 
         self.load_history()
-        self.root.after(120, self._pump)
-        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
-
-    # -- widgets ----------------------------------------------------------- #
-
-    def _build_target(self, parent):
-        box = ttk.LabelFrame(parent, text="Images to process", padding=8)
-        box.pack(fill="x")
-        box.columnconfigure(1, weight=1)
-
-        ttk.Label(box, text="Folder:").grid(row=0, column=0, sticky="w")
-        self.folder = tk.StringVar()
-        ttk.Entry(box, textvariable=self.folder).grid(
-            row=0, column=1, sticky="ew", padx=6)
-        ttk.Button(box, text="Browse...", command=self.pick_folder).grid(
-            row=0, column=2)
-        self.folder.trace_add("write", lambda *_a: self.refresh_count())
-
-        self.recursive = tk.BooleanVar(value=False)
-        ttk.Checkbutton(box, text="Include subfolders",
-                        variable=self.recursive,
-                        command=self.refresh_count).grid(
-                            row=1, column=1, sticky="w", padx=6, pady=(6, 0))
-
-        self.count_label = ttk.Label(box, text="No folder selected.")
-        self.count_label.grid(row=2, column=1, sticky="w", padx=6, pady=(4, 0))
-
-    def _build_changes(self, parent):
-        box = ttk.LabelFrame(parent, text="Changes to apply", padding=8)
-        box.pack(fill="both", expand=True, pady=(10, 0))
-
-        bar = ttk.Frame(box)
-        bar.pack(fill="x", pady=(0, 6))
-        ttk.Button(bar, text="Select all",
-                   command=lambda: self.select_all(True)).pack(side="left")
-        ttk.Button(bar, text="Select none",
-                   command=lambda: self.select_all(False)).pack(
-                       side="left", padx=6)
-        ttk.Button(bar, text="Reload from image",
-                   command=self.load_history).pack(side="left")
-
-        self.scroller = tksiril.ScrollableFrame(box)
-        self.scroller.pack(fill="both", expand=True)
-        self.list_frame = self.scroller.scrollable_frame
-
-    def _build_output(self, parent):
-        box = ttk.LabelFrame(parent, text="Output", padding=8)
-        box.pack(fill="x", pady=(10, 0))
-        box.columnconfigure(1, weight=1)
-
-        self.overwrite = tk.BooleanVar(value=False)
-        ttk.Checkbutton(box, text="Overwrite the original images",
-                        variable=self.overwrite,
-                        command=self.update_output_state).grid(
-                            row=0, column=0, columnspan=3, sticky="w")
-
-        self.out_caption = ttk.Label(box, text="Save to:")
-        self.out_caption.grid(row=1, column=0, sticky="w", pady=(6, 0))
-        self.out_folder = tk.StringVar()
-        self.out_entry = ttk.Entry(box, textvariable=self.out_folder)
-        self.out_entry.grid(row=1, column=1, sticky="ew", padx=6, pady=(6, 0))
-        self.out_button = ttk.Button(box, text="Browse...",
-                                     command=self.pick_output)
-        self.out_button.grid(row=1, column=2, pady=(6, 0))
         self.update_output_state()
+        self._fit_to_screen()
 
-    def _build_status(self, parent):
-        box = ttk.Frame(parent)
-        box.pack(fill="x", pady=(10, 0))
-        self.progress = ttk.Progressbar(box, mode="determinate")
-        self.progress.pack(fill="x")
-        self.status = ttk.Label(box, text="Ready.")
-        self.status.pack(fill="x", pady=(4, 0))
+    # -- layout -------------------------------------------------------------
 
-        log_box = ttk.Frame(parent)
-        log_box.pack(fill="both", pady=(6, 0))
-        self.log = tk.Text(log_box, height=7, wrap="none", state="disabled")
-        scroll = ttk.Scrollbar(log_box, orient="vertical",
-                               command=self.log.yview)
-        self.log.configure(yscrollcommand=scroll.set)
-        scroll.pack(side="right", fill="y")
-        self.log.pack(side="left", fill="both", expand=True)
+    def _build_widgets(self) -> None:
+        outer = QtWidgets.QVBoxLayout(self)
+        outer.setContentsMargins(8, 8, 8, 8)
 
-    def _build_buttons(self, parent):
-        box = ttk.Frame(parent)
-        box.pack(fill="x", pady=(10, 0))
-        ttk.Button(box, text="Close", command=self.on_close).pack(side="right")
-        self.sync_button = ttk.Button(box, text="Sync", command=self.on_sync)
-        self.sync_button.pack(side="right", padx=6)
+        self.source_label = QtWidgets.QLabel("")
+        self.source_label.setWordWrap(True)
+        outer.addWidget(self.source_label)
 
-    # -- history ----------------------------------------------------------- #
+        # --- target ---
+        box = QtWidgets.QGroupBox("Images to process")
+        grid = QtWidgets.QGridLayout(box)
+        grid.addWidget(QtWidgets.QLabel("Folder:"), 0, 0)
+        self.ed_folder = QtWidgets.QLineEdit()
+        self.ed_folder.textChanged.connect(self.refresh_count)
+        grid.addWidget(self.ed_folder, 0, 1)
+        btn = QtWidgets.QPushButton("Browse...")
+        btn.clicked.connect(self.pick_folder)
+        grid.addWidget(btn, 0, 2)
 
-    def load_history(self):
+        self.chk_recursive = QtWidgets.QCheckBox("Include subfolders")
+        self.chk_recursive.toggled.connect(self.refresh_count)
+        grid.addWidget(self.chk_recursive, 1, 1)
+
+        self.count_label = QtWidgets.QLabel("No folder selected.")
+        grid.addWidget(self.count_label, 2, 1)
+        grid.setColumnStretch(1, 1)
+        outer.addWidget(box)
+
+        # --- changes ---
+        box = QtWidgets.QGroupBox("Changes to apply")
+        inner = QtWidgets.QVBoxLayout(box)
+        bar = QtWidgets.QHBoxLayout()
+        for text, slot in (("Select all", lambda: self.select_all(True)),
+                           ("Select none", lambda: self.select_all(False)),
+                           ("Reload from image", self.load_history)):
+            button = QtWidgets.QPushButton(text)
+            button.clicked.connect(slot)
+            bar.addWidget(button)
+        bar.addStretch(1)
+        inner.addLayout(bar)
+
+        self.scroller = QtWidgets.QScrollArea()
+        self.scroller.setWidgetResizable(True)
+        self.list_frame = QtWidgets.QWidget()
+        self.list_layout = QtWidgets.QVBoxLayout(self.list_frame)
+        self.list_layout.setContentsMargins(4, 4, 4, 4)
+        self.list_layout.addStretch(1)
+        self.scroller.setWidget(self.list_frame)
+        self.scroller.setMinimumHeight(180)
+        inner.addWidget(self.scroller, 1)
+        outer.addWidget(box, 1)
+
+        # --- output ---
+        box = QtWidgets.QGroupBox("Output")
+        grid = QtWidgets.QGridLayout(box)
+        self.chk_overwrite = QtWidgets.QCheckBox("Overwrite the original images")
+        self.chk_overwrite.toggled.connect(self.update_output_state)
+        grid.addWidget(self.chk_overwrite, 0, 0, 1, 3)
+        self.out_caption = QtWidgets.QLabel("Save to:")
+        grid.addWidget(self.out_caption, 1, 0)
+        self.ed_output = QtWidgets.QLineEdit()
+        grid.addWidget(self.ed_output, 1, 1)
+        self.out_button = QtWidgets.QPushButton("Browse...")
+        self.out_button.clicked.connect(self.pick_output)
+        grid.addWidget(self.out_button, 1, 2)
+        grid.setColumnStretch(1, 1)
+        outer.addWidget(box)
+
+        # --- progress ---
+        self.progress = QtWidgets.QProgressBar()
+        self.progress.setRange(0, 100)
+        outer.addWidget(self.progress)
+        self.status = QtWidgets.QLabel("Ready.")
+        outer.addWidget(self.status)
+        self.text = QtWidgets.QPlainTextEdit()
+        self.text.setReadOnly(True)
+        self.text.setLineWrapMode(QtWidgets.QPlainTextEdit.LineWrapMode.NoWrap)
+        self.text.setMinimumHeight(110)
+        outer.addWidget(self.text)
+
+        buttons = QtWidgets.QHBoxLayout()
+        buttons.addStretch(1)
+        btn = QtWidgets.QPushButton("Close")
+        btn.clicked.connect(self.close)
+        buttons.addWidget(btn)
+        self.sync_button = QtWidgets.QPushButton("Sync")
+        self.sync_button.setDefault(True)
+        self.sync_button.clicked.connect(self.on_sync)
+        buttons.addWidget(self.sync_button)
+        outer.addLayout(buttons)
+
+    def _fit_to_screen(self) -> None:
+        """Size the window to its content, never larger than the screen."""
+        available = QtGui.QGuiApplication.primaryScreen().availableGeometry()
+        hint = self.sizeHint()
+        width = min(max(hint.width(), 640), int(available.width() * 0.92))
+        height = min(max(hint.height(), 520), int(available.height() * 0.85))
+        self.setMinimumSize(min(620, width), min(460, height))
+        self.resize(width, height)
+        self.move(available.x() + (available.width() - width) // 2,
+                  available.y() + (available.height() - height) // 3)
+
+    # -- history ------------------------------------------------------------
+
+    def _clear_rows(self) -> None:
         for row in self.rows:
-            row.frame.destroy()
+            row.setParent(None)
+            row.deleteLater()
         self.rows = []
-        for child in self.list_frame.winfo_children():
-            child.destroy()
+        while self.list_layout.count() > 1:      # keep the trailing stretch
+            item = self.list_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+                widget.deleteLater()
+
+    def load_history(self) -> None:
+        self._clear_rows()
 
         try:
             if not self.siril.is_image_loaded():
-                self.source_label.configure(
-                    text="No image is loaded in Siril. Load the image you have "
-                         "processed, then press \"Reload from image\".")
+                self.source_label.setText(
+                    "No image is loaded in Siril. Load the image you have "
+                    "processed, then press \"Reload from image\".")
                 return
             filename = self.siril.get_image_filename()
             history = self.siril.get_image_history() or []
         except s.SirilError as exc:
-            self.source_label.configure(
-                text="Could not read the loaded image: %s" % exc)
+            self.source_label.setText(
+                "Could not read the loaded image: %s" % exc)
             return
 
         self.source_path = os.path.abspath(filename) if filename else None
-        self.source_label.configure(
-            text="Source image: %s" % (filename or "(unsaved image)"))
+        self.source_label.setText(
+            "Source image: %s" % (filename or "(unsaved image)"))
 
         baseline = (read_fits_history(self.source_path)
                     if self.source_path else None)
@@ -554,16 +636,15 @@ class SirilSync:
                 baseline_len += 1
 
         if not history:
-            ttk.Label(self.list_frame,
-                      text="This image has no HISTORY entries.").pack(
-                          anchor="w", pady=4)
+            label = QtWidgets.QLabel("This image has no HISTORY entries.")
+            self.list_layout.insertWidget(self.list_layout.count() - 1, label)
             return
 
         for index, entry in enumerate(history):
             command, level, note = translate(entry)
-            row = ChangeRow(self.list_frame, index + 1, entry, command, level,
-                            note, pre_existing=index < baseline_len)
-            row.pack(fill="x", expand=True)
+            row = ChangeRow(index + 1, entry, command, level, note,
+                            pre_existing=index < baseline_len)
+            self.list_layout.insertWidget(self.list_layout.count() - 1, row)
             self.rows.append(row)
 
         if baseline is None:
@@ -574,94 +655,83 @@ class SirilSync:
                            "image was loaded."
                            % (len(history) - baseline_len, len(history)))
 
-    def select_all(self, value):
+    def select_all(self, value) -> None:
         for row in self.rows:
-            if value and not row.command.get().strip():
-                continue
-            row.enabled.set(value)
+            row.set_enabled(value)
 
-    # -- folders ----------------------------------------------------------- #
+    # -- folders ------------------------------------------------------------
 
-    def pick_folder(self):
-        path = filedialog.askdirectory(
-            title="Select the folder with the images", parent=self.root)
+    def pick_folder(self) -> None:
+        path = QtWidgets.QFileDialog.getExistingDirectory(
+            self, "Select the folder with the images",
+            self.ed_folder.text().strip() or os.getcwd())
         if path:
-            self.folder.set(os.path.normpath(path))
+            self.ed_folder.setText(os.path.normpath(path))
 
-    def pick_output(self):
-        path = filedialog.askdirectory(title="Select the output folder",
-                                       parent=self.root)
+    def pick_output(self) -> None:
+        path = QtWidgets.QFileDialog.getExistingDirectory(
+            self, "Select the output folder",
+            self.ed_output.text().strip() or os.getcwd())
         if path:
-            self.out_folder.set(os.path.normpath(path))
+            self.ed_output.setText(os.path.normpath(path))
 
-    def update_output_state(self):
-        state = "disabled" if self.overwrite.get() else "normal"
-        self.out_entry.configure(state=state)
-        self.out_button.configure(state=state)
-        self.out_caption.configure(state=state)
+    def update_output_state(self) -> None:
+        on = not self.chk_overwrite.isChecked()
+        self.ed_output.setEnabled(on)
+        self.out_button.setEnabled(on)
+        self.out_caption.setEnabled(on)
 
-    def refresh_count(self):
-        folder = self.folder.get().strip()
+    def refresh_count(self) -> None:
+        folder = self.ed_folder.text().strip()
         if not folder or not os.path.isdir(folder):
-            self.count_label.configure(text="No folder selected.")
+            self.count_label.setText("No folder selected.")
             return
-        files = list_images(folder, self.recursive.get())
-        self.count_label.configure(text="%d image(s) found." % len(files))
+        files = list_images(folder, self.chk_recursive.isChecked())
+        self.count_label.setText("%d image(s) found." % len(files))
 
-    # -- logging ----------------------------------------------------------- #
+    # -- logging ------------------------------------------------------------
 
-    def write_log(self, text):
-        self.log.configure(state="normal")
-        self.log.insert("end", text + "\n")
-        self.log.see("end")
-        self.log.configure(state="disabled")
+    def write_log(self, text) -> None:
+        self._append_log(text, None)
 
-    def _pump(self):
-        try:
-            while True:
-                kind, payload = self.messages.get_nowait()
-                if kind == "log":
-                    self.write_log(payload)
-                elif kind == "status":
-                    self.status.configure(text=payload)
-                elif kind == "progress":
-                    self.progress.configure(value=payload)
-                elif kind == "maximum":
-                    self.progress.configure(maximum=payload, value=0)
-                elif kind == "done":
-                    self.on_worker_finished(payload)
-        except queue.Empty:
-            pass
-        self.root.after(120, self._pump)
+    def _append_log(self, message, color=None) -> None:
+        colour = LOG_COLOURS[self.log_theme].get(
+            (color or "").lower() if color else "")
+        if colour:
+            self.text.appendHtml(
+                '<span style="color:%s; white-space:pre">%s</span>'
+                % (colour, html.escape(message)))
+        else:
+            self.text.appendPlainText(message)
 
-    def post(self, kind, payload=None):
-        self.messages.put((kind, payload))
+    def _set_maximum(self, value) -> None:
+        self.progress.setRange(0, max(value, 1))
+        self.progress.setValue(0)
 
-    # -- sync -------------------------------------------------------------- #
+    # -- sync ---------------------------------------------------------------
 
-    def on_sync(self):
+    def on_sync(self) -> None:
         if self.worker and self.worker.is_alive():
             return
 
-        commands = [row.command.get().strip() for row in self.rows
-                    if row.is_active()]
+        commands = [row.command() for row in self.rows if row.is_active()]
         if not commands:
-            messagebox.showwarning("SirilSync", "No change is selected.",
-                                   parent=self.root)
+            QtWidgets.QMessageBox.warning(self, "SirilSync",
+                                          "No change is selected.")
             return
 
-        folder = self.folder.get().strip()
+        folder = self.ed_folder.text().strip()
         if not folder or not os.path.isdir(folder):
-            messagebox.showwarning(
-                "SirilSync", "Select a valid folder with the images to "
-                             "process.", parent=self.root)
+            QtWidgets.QMessageBox.warning(
+                self, "SirilSync",
+                "Select a valid folder with the images to process.")
             return
 
-        files = list_images(folder, self.recursive.get())
+        files = list_images(folder, self.chk_recursive.isChecked())
         if not files:
-            messagebox.showwarning(
-                "SirilSync", "No supported image was found in that folder.",
-                parent=self.root)
+            QtWidgets.QMessageBox.warning(
+                self, "SirilSync",
+                "No supported image was found in that folder.")
             return
 
         # The loaded image is processed like any other file in the folder: the
@@ -670,28 +740,28 @@ class SirilSync:
         includes_source = bool(self.source_path) and any(
             os.path.abspath(f) == self.source_path for f in files)
 
-        overwrite = self.overwrite.get()
-        out_folder = self.out_folder.get().strip()
+        overwrite = self.chk_overwrite.isChecked()
+        out_folder = self.ed_output.text().strip()
         if not overwrite:
             if not out_folder:
-                messagebox.showwarning(
-                    "SirilSync", "Choose an output folder, or enable "
-                                 "\"Overwrite the original images\".",
-                    parent=self.root)
+                QtWidgets.QMessageBox.warning(
+                    self, "SirilSync",
+                    "Choose an output folder, or enable \"Overwrite the "
+                    "original images\".")
                 return
             if not os.path.isdir(out_folder):
                 try:
                     os.makedirs(out_folder)
                 except OSError as exc:
-                    messagebox.showerror(
-                        "SirilSync", "Cannot create the output folder:\n%s"
-                                     % exc, parent=self.root)
+                    QtWidgets.QMessageBox.critical(
+                        self, "SirilSync",
+                        "Cannot create the output folder:\n%s" % exc)
                     return
             if os.path.abspath(out_folder) == os.path.abspath(folder):
-                messagebox.showerror(
-                    "SirilSync", "The output folder is the same as the source "
-                                 "folder. Enable overwriting, or pick a "
-                                 "different folder.", parent=self.root)
+                QtWidgets.QMessageBox.critical(
+                    self, "SirilSync",
+                    "The output folder is the same as the source folder. "
+                    "Enable overwriting, or pick a different folder.")
                 return
 
         flagged = [row for row in self.rows
@@ -700,8 +770,7 @@ class SirilSync:
         if flagged:
             warning = ("\n\nThese selected changes could not be fully "
                        "recovered from the history:\n"
-                       + "\n".join("    %s" % row.command.get().strip()
-                                   for row in flagged)
+                       + "\n".join("    %s" % row.command() for row in flagged)
                        + "\nCheck their commands before continuing.")
 
         source_note = ""
@@ -713,20 +782,69 @@ class SirilSync:
 
         target = ("the original files will be overwritten" if overwrite
                   else out_folder)
-        if not messagebox.askokcancel(
-                "SirilSync",
-                "Apply %d change(s) to %d image(s)?\n\nOutput: %s%s%s"
-                % (len(commands), len(files), target, source_note, warning),
-                parent=self.root):
+        answer = QtWidgets.QMessageBox.question(
+            self, "SirilSync",
+            "Apply %d change(s) to %d image(s)?\n\nOutput: %s%s%s"
+            % (len(commands), len(files), target, source_note, warning))
+        if answer != QtWidgets.QMessageBox.StandardButton.Yes:
             return
 
         self.cancel.clear()
-        self.sync_button.configure(state="disabled")
-        self.post("maximum", len(files))
+        self.sync_button.setEnabled(False)
+        self.progress_max.emit(len(files))
         self.worker = threading.Thread(
             target=self._run, args=(files, commands, overwrite, out_folder),
             daemon=True)
         self.worker.start()
+
+    # -- the sinks the worker writes into -----------------------------------
+
+    def post(self, kind, payload=None) -> None:
+        """Kept so the worker body reads the same as it always did."""
+        if kind == "log":
+            self.log_line.emit(payload, None)
+        elif kind == "status":
+            self.status_changed.emit(payload)
+        elif kind == "progress":
+            self.progress_changed.emit(payload)
+        elif kind == "maximum":
+            self.progress_max.emit(payload)
+        elif kind == "done":
+            self.run_finished.emit(payload[0], payload[1])
+
+    def on_worker_finished(self, done, failed) -> None:
+        self.sync_button.setEnabled(True)
+        message = "Finished: %d processed, %d failed." % (done, failed)
+        self.status.setText(message)
+        self.write_log(message)
+        try:
+            self.siril.log("SirilSync: " + message)
+        except Exception:
+            pass
+        if failed:
+            QtWidgets.QMessageBox.warning(
+                self, "SirilSync", message + "\nSee the log for details.")
+        else:
+            QtWidgets.QMessageBox.information(
+                self, "SirilSync", "%d image(s) processed." % done)
+
+    # -- closing ------------------------------------------------------------
+
+    def closeEvent(self, event) -> None:
+        if self.worker and self.worker.is_alive():
+            answer = QtWidgets.QMessageBox.question(
+                self, "SirilSync", "A sync is running. Stop it and close?")
+            if answer != QtWidgets.QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
+            self.cancel.set()
+            self.worker.join(timeout=15)
+        try:
+            self.siril.disconnect()
+        except Exception:
+            pass
+        event.accept()
+
 
     def _run(self, files, commands, overwrite, out_folder):
         siril = self.siril
@@ -794,43 +912,6 @@ class SirilSync:
                     pass
             self.post("done", (done, failed))
 
-    def on_worker_finished(self, result):
-        done, failed = result
-        self.sync_button.configure(state="normal")
-        message = "Finished: %d processed, %d failed." % (done, failed)
-        self.status.configure(text=message)
-        self.write_log(message)
-        try:
-            self.siril.log("SirilSync: " + message)
-        except Exception:
-            pass
-        if failed:
-            messagebox.showwarning(
-                "SirilSync", message + "\nSee the log for details.",
-                parent=self.root)
-        else:
-            messagebox.showinfo("SirilSync", "%d image(s) processed." % done,
-                                parent=self.root)
-
-    # -- closing ----------------------------------------------------------- #
-
-    def on_close(self):
-        if self.worker and self.worker.is_alive():
-            if not messagebox.askokcancel(
-                    "SirilSync", "A sync is running. Stop it and close?",
-                    parent=self.root):
-                return
-            self.cancel.set()
-            self.worker.join(timeout=15)
-        try:
-            self.siril.disconnect()
-        except Exception:
-            pass
-        self.root.quit()
-        self.root.destroy()
-
-
-# --------------------------------------------------------------------------- #
 
 def main():
     siril = s.SirilInterface()
@@ -840,20 +921,19 @@ def main():
         print("SirilSync: could not connect to Siril: %s" % exc)
         return
 
-    root = ThemedTk()
-    try:
-        tksiril.match_theme_to_siril(root, siril)
-    except Exception:
-        pass
+    app = QtWidgets.QApplication.instance()
+    owns_app = app is None
+    if owns_app:
+        app = QtWidgets.QApplication(sys.argv[:1])
+    apply_siril_theme(app, siril)
 
-    SirilSync(root, siril)
+    window = SirilSyncWindow(siril)
+    window.show()
+    window.raise_()
+    window.activateWindow()
 
-    try:
-        tksiril.elevate(root)
-    except Exception:
-        pass
-
-    root.mainloop()
+    if owns_app:
+        app.exec()
 
 
 if __name__ == "__main__":

@@ -1,7 +1,7 @@
 # Siril Scripts
 
 Python scripts for [Siril](https://siril.org/) 1.4+ that use the `sirilpy`
-interface. Each one opens a Tkinter dialog, runs its work on a background thread
+interface. Each one opens a PyQt6 dialog, runs its work on a background thread
 and reports progress into Siril's log, so the Siril window stays responsive.
 
 | Script | What it does |
@@ -15,9 +15,11 @@ and reports progress into Siril's log, so the Siril window stays responsive.
 ## Requirements
 
 - Siril **1.4** or newer, built with the Python (`sirilpy`) interface.
-- `ttkthemes` — installed on demand through `sirilpy.ensure_installed()`.
-  Every script except `SirilSync.py` falls back to a plain `tkinter.Tk` window
-  if the themed toolkit is unavailable; `SirilSync.py` requires it.
+- **PyQt6** — already part of Siril's Python environment (Siril 1.4 bundles
+  PyQt6 6.11 / Qt 6.11), so normally there is nothing to install. If it is
+  somehow missing, the scripts ask `sirilpy.ensure_installed()` for it. The
+  scripts that have a `--no-gui` mode do not need Qt at all in that mode;
+  `SirilSync.py` is GUI-only and always needs it.
 
 ## Installation
 
@@ -38,6 +40,21 @@ python siril_dark_calibration.py --work-dir "D:/astro/M31" --no-gui
 
 `SirilSync.py` has no command-line interface — it is GUI only, because it needs
 an image loaded in the running Siril instance.
+
+## The dialogs
+
+Every dialog is a **PyQt6** window, built with the Qt binding that ships inside
+Siril's own Python environment, so nothing has to be installed alongside.
+
+- They follow Siril's own light/dark preference, read from `gui.theme`, and
+  switch to a matching dark palette when Siril is dark.
+- The embedded log is **colour-coded** the same way Siril's own log is — blue
+  for step headings, green for results, salmon for warnings, red for errors —
+  with a separate palette per theme so it stays readable either way.
+- Work runs on a background thread and reports back through Qt signals, which Qt
+  delivers on the GUI thread, so the window never freezes while Siril works.
+- Each window sizes itself to its content and is clamped to the available screen
+  area, so it fits on a laptop display.
 
 ---
 
@@ -602,6 +619,58 @@ Any calibration folder may be missing: that master is skipped and the
 `calibrate` call is built from what is actually present. The dialog reports the
 frame counts it found before you start.
 
+## Dark optimization
+
+When the lights were shot at a shorter exposure than the master dark, the dark
+can be **scaled** before it is subtracted instead of being used as it is:
+
+| `--dark-opt` | What Siril does |
+| --- | --- |
+| `none` *(default)* | The master dark is subtracted unchanged. |
+| `auto` | `calibrate -opt` — the scaling factor is fitted from the data. |
+| `exp` | `calibrate -opt=exp` — the factor comes from the exposure keyword. |
+
+Both modes need **a master bias as well as a master dark**. A dark frame is bias
+pedestal plus dark current, and only the dark current scales with exposure, so
+Siril has to remove the pedestal first — which is why the bias master is passed
+to the lights in this mode, and only in this mode. The script checks for both up
+front and refuses with a message naming the missing one, rather than letting
+`calibrate` fail partway through.
+
+With optimization on, the log compares the two exposures before calibrating:
+
+```
+  dark optimization: exp
+      light 120s vs master dark 300s (ratio 0.400)
+      the lights are shorter, so the dark is scaled down.
+```
+
+If the lights turn out to be *longer* than the dark it says so too — scaling a
+dark up extrapolates its noise, and matching the exposures is the better fix.
+
+## Ready-made masters
+
+If you already have a master, point the script at it and that whole branch is
+skipped — no conversion, no stacking, and the matching input directory is
+ignored:
+
+| Given | Effect |
+| --- | --- |
+| `--master-bias PATH` | The bias directory is not touched; the flats are calibrated with this master. |
+| `--master-flat PATH` | The flat directory is not touched, and neither is the bias calibration of the flats. |
+| `--master-dark PATH` | The dark directory is not touched. |
+
+They mix freely: give only a master dark and the bias and flat masters are still
+built from their directories as usual. The extension may be left off
+(`--master-dark process/dark_stacked` finds `dark_stacked.fit`), a relative path
+is taken from the working directory, and a master that already sits in the
+process directory is passed to `calibrate` by its bare name rather than as a
+path. A file that does not exist stops the run before any work is done.
+
+In the dialog this is the **Masters** tab. Filling one in greys out the matching
+directory on the Input tab, and the Input summary shows `darks: master` in place
+of a frame count, so it is always clear which branch will run.
+
 ## Pipeline
 
 | Step | Commands |
@@ -689,8 +758,8 @@ dialog warns about the cost when you do.
 
 ## Options
 
-The settings sit on four tabs — **Input**, **Calibration**, **Registration**
-and **Extraction** — with the progress area and the buttons always visible below
+The settings sit on four tabs — **Input**, **Calibration**,
+**Registration** and **Extraction** — with the progress area and the buttons always visible below
 them, so the window stays short enough for a laptop screen. On first open it
 sizes itself to its content and is clamped to the available screen area.
 
@@ -702,6 +771,7 @@ sizes itself to its content and is clamped to the available screen area.
 | **-cfa** | Calibration | on | Makes the cosmetic correction aware of the Bayer matrix. |
 | **-equalize_cfa** | Calibration | on | Equalises the RGB means of the master flat; only applied when there is one. |
 | **-debayer** | Calibration | on | Forced on while registration is enabled. |
+| **Dark optimization** | Calibration | None | Greyed-out explanation when a master bias or dark is missing. |
 | **Register the calibrated lights** | Registration | on | Untick to stop after calibration. |
 | **Interpolation** | Registration | None (whole-pixel shift) | See above. |
 | **Transformation** | Registration | Shift | Ignored when the interpolation is *None*. |
@@ -718,11 +788,15 @@ sizes itself to its content and is clamped to the available screen area.
 | `--work-dir PATH` | Siril's working directory | Project directory. |
 | `--lights` / `--biases` / `--flats` / `--darks PATH` | auto | Input directories. |
 | `--process NAME` | `process` | Directory for the sequences and masters. |
+| `--master-bias PATH` | — | Use this master bias instead of building one. |
+| `--master-flat PATH` | — | Use this master flat instead of building one. |
+| `--master-dark PATH` | — | Use this master dark instead of building one. |
 | `--rejection {p,s,m,w,l,g,a,n}` | `w` | Rejection for the master stacks. |
 | `--sigma-low F` / `--sigma-high F` | `3.0` | Rejection sigmas. |
 | `--16bit` | 32-bit float | Work in 16-bit mode. |
 | `--no-cosmetic` | on | Disable `-cc=dark`. |
 | `--cc-sigma-low F` / `--cc-sigma-high F` | `3.0` | Cosmetic correction sigmas. |
+| `--dark-opt {none,auto,exp}` | `none` | Scale the master dark before subtracting it. Needs a master bias too. |
 | `--no-cfa` | on | Do not pass `-cfa`. |
 | `--no-equalize-cfa` | on | Do not pass `-equalize_cfa`. |
 | `--no-debayer` | on | Keep the CFA mosaic. Incompatible with registration. |
@@ -740,6 +814,18 @@ Whole path plus the green channel, no dialog:
 
 ```bash
 python VarStarOSCPreprocess.py --work-dir "D:/astro/RR_Lyr" --extract G --no-gui
+```
+
+Short lights against a longer master dark, scaled by exposure:
+
+```bash
+python VarStarOSCPreprocess.py --work-dir "D:/astro/RR_Lyr" --dark-opt exp --no-gui
+```
+
+Reusing masters built on an earlier night, so only the lights are processed:
+
+```bash
+python VarStarOSCPreprocess.py --work-dir "D:/astro/RR_Lyr" --master-dark "D:/astro/masters/dark_600s.fit" --master-flat "D:/astro/masters/flat.fit" --extract G --no-gui
 ```
 
 Whole path without extraction:

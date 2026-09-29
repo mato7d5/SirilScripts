@@ -39,6 +39,7 @@ Without arguments the GUI opens. Command line arguments pre-fill the form; with
 from __future__ import annotations
 
 import argparse
+import html
 import os
 import re
 import sys
@@ -58,10 +59,17 @@ try:
 except ImportError:  # builds of sirilpy without LogColor
     LogColor = None
 
+# PyQt6 is the Qt binding that ships in Siril's own Python environment
+# (Siril 1.4 bundles PyQt6 6.11 / Qt 6.11). Kept tolerant so --no-gui still
+# works on an installation without it.
 try:
-    from sirilpy import tksiril  # matches the GUI to Siril's theme (1.4.x)
+    from PyQt6 import QtCore, QtGui, QtWidgets
 except ImportError:
-    tksiril = None
+    try:
+        s.ensure_installed("PyQt6")
+        from PyQt6 import QtCore, QtGui, QtWidgets
+    except Exception:
+        QtCore = QtGui = QtWidgets = None
 
 
 CHANNELS = ("R", "G", "B")
@@ -88,6 +96,16 @@ KIND_CFA = "cfa"
 KIND_RGB = "rgb"
 KIND_MONO = "mono"
 KIND_UNKNOWN = "unknown"
+
+# Siril's log colours, in a light and a dark variant so the embedded log stays
+# readable whichever theme Siril is set to.
+LOG_COLOURS = {
+    "light": {"green": "#1b6e2b", "salmon": "#b34a20", "blue": "#14539a",
+              "red": "#b3261e"},
+    "dark": {"green": "#7fd18c", "salmon": "#ffb08f", "blue": "#7cb6f2",
+             "red": "#ff9b94"},
+}
+
 
 class ExtractError(RuntimeError):
     """An error we can explain to the user in plain language."""
@@ -601,485 +619,529 @@ def run_pipeline(siril, args, info: SeqInfo | None = None, cancel=None) -> str:
 
 
 # ---------------------------------------------------------------------------
-# GUI (tkinter + tksiril - the recommended approach for Siril 1.4.x)
+# GUI (PyQt6 - the Qt binding that ships in Siril's Python environment)
 # ---------------------------------------------------------------------------
-
-def build_root():
-    """The main window; uses the themed variant when ttkthemes is available."""
-    try:
-        s.ensure_installed("ttkthemes")
-        from ttkthemes import ThemedTk
-        return ThemedTk()
-    except Exception:
-        import tkinter as tk
-        return tk.Tk()
-
 
 PLANE_AUTO = "Automatic (from BAYERPAT)"
 
 
-class ChannelExtractGUI:
-    """Sequence picker and channel chooser; the work runs on its own thread."""
+if QtWidgets is not None:
 
-    def __init__(self, root, siril, defaults):
-        import queue
-        import tkinter as tk
-        from tkinter import ttk
+    class ChannelExtractWindow(QtWidgets.QWidget):
+        """Sequence picker and channel chooser; the work runs on its own thread.
 
-        self.tk = tk
-        self.ttk = ttk
-        self.root = root
-        self.siril = siril
-        self.defaults = defaults
-        self.queue = queue.Queue()
-        self.running = False
-        self.alive = True
-        self.pump_id = None
-        self.cancel = threading.Event()
-        self.info: SeqInfo | None = None
+        The worker reports back through Qt signals, which Qt delivers on the GUI
+        thread, so no widget is touched from the wrong thread.
+        """
 
-        root.title("Extract a colour channel from an OSC sequence")
-        root.minsize(720, 620)
+        log_line = QtCore.pyqtSignal(str, object)
+        progress_changed = QtCore.pyqtSignal(int, int)
+        run_finished = QtCore.pyqtSignal(object, object)
 
-        if tksiril is not None:
-            try:
-                self.style = tksiril.standard_style()
-                tksiril.match_theme_to_siril(root, siril)
-            except Exception:
-                self.style = ttk.Style()
-        else:
-            self.style = ttk.Style()
-
-        try:
-            wd = siril.get_siril_wd() or ""
-        except Exception:
-            wd = ""
-
-        d = defaults
-        self.var_work = tk.StringVar(value=d.work_dir or wd)
-        self.var_seq = tk.StringVar(value=clean_seq_name(d.sequence or ""))
-        self.var_channel = tk.StringVar(value=(d.channel or "R").upper())
-        self.var_plane = tk.StringVar(value=PLANE_AUTO)
-        self.var_plane_hint = tk.StringVar(value="")
-        self.var_prefix = tk.StringVar(value=d.prefix or "")
-        self.var_auto_prefix = tk.BooleanVar(value=d.prefix is None)
-        self.var_make_seq = tk.BooleanVar(value=d.make_seq)
-        self.var_detected = tk.StringVar(value="Choose a sequence.")
-        self.var_status = tk.StringVar(value="Ready.")
-
-        self._build_widgets()
-        self._refresh_sequences()
-        if self.var_seq.get():
-            self._analyse()
-        else:
-            # nothing to analyse yet, but the controls still have to reflect it
-            self._sync_channel()
-        self._sync_prefix()
-        self.pump_id = self.root.after(100, self._pump)
-        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
-
-    # -- layout -------------------------------------------------------------
-
-    def _build_widgets(self) -> None:
-        ttk, tk = self.ttk, self.tk
-        from tkinter import scrolledtext
-
-        main = ttk.Frame(self.root, padding=10)
-        main.pack(fill="both", expand=True)
-        main.columnconfigure(0, weight=1)
-
-        # --- sequence ---
-        box = ttk.LabelFrame(main, text="Sequence", padding=8)
-        box.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-        box.columnconfigure(1, weight=1)
-
-        ttk.Label(box, text="Working directory:").grid(row=0, column=0, sticky="w",
-                                                       pady=2)
-        entry = ttk.Entry(box, textvariable=self.var_work)
-        entry.grid(row=0, column=1, sticky="ew", padx=6, pady=2)
-        self._tip(entry, "The directory holding the sequence. Defaults to "
-                         "Siril's working directory.")
-        ttk.Button(box, text="...", width=3, command=self._browse).grid(
-            row=0, column=2, pady=2)
-
-        ttk.Label(box, text="Sequence:").grid(row=1, column=0, sticky="w", pady=2)
-        self.cmb_seq = ttk.Combobox(box, textvariable=self.var_seq)
-        self.cmb_seq.grid(row=1, column=1, sticky="ew", padx=6, pady=2)
-        self.cmb_seq.bind("<<ComboboxSelected>>", lambda _e: self._analyse())
-        self.cmb_seq.bind("<Return>", lambda _e: self._analyse())
-        self._tip(self.cmb_seq, "Name of the sequence, e.g. 'light_'. The list "
-                                "holds the .seq files found in the directory.")
-        ttk.Button(box, text="Analyse", command=self._analyse).grid(
-            row=1, column=2, pady=2)
-
-        self.lbl_detected = ttk.Label(box, textvariable=self.var_detected,
-                                      wraplength=640, justify="left")
-        self.lbl_detected.grid(row=2, column=0, columnspan=3, sticky="w",
-                               pady=(6, 0))
-
-        # --- channel ---
-        box = ttk.LabelFrame(main, text="Channel to extract", padding=8)
-        box.grid(row=1, column=0, sticky="ew", pady=(0, 8))
-        box.columnconfigure(3, weight=1)
-
-        self.radios = []
-        for index, channel in enumerate(CHANNELS):
-            radio = ttk.Radiobutton(box, text=CHANNEL_LABELS[channel] +
-                                    " (" + channel + ")",
-                                    variable=self.var_channel, value=channel,
-                                    command=self._sync_channel)
-            radio.grid(row=0, column=index, sticky="w", padx=(0, 16), pady=2)
-            self.radios.append(radio)
-
-        ttk.Label(box, text="CFA plane:").grid(row=1, column=0, sticky="w", pady=2)
-        self.cmb_plane = ttk.Combobox(
-            box, textvariable=self.var_plane, state="readonly",
-            values=[PLANE_AUTO, "0", "1", "2", "3"])
-        self.cmb_plane.grid(row=1, column=1, columnspan=2, sticky="ew", padx=6,
-                            pady=2)
-        self._tip(self.cmb_plane,
-                  "Which quarter of the 2x2 Bayer cell to keep. Automatic reads "
-                  "it from BAYERPAT; override it if red and blue come out "
-                  "swapped. Green normally uses seqextract_Green instead, which "
-                  "combines both green pixels - picking a plane here forces a "
-                  "single one.")
-
-        # A disabled ttk widget does not fire the tooltip, so the reason it is
-        # greyed out has to be visible without hovering.
-        ttk.Label(box, textvariable=self.var_plane_hint, wraplength=620,
-                  justify="left").grid(row=2, column=0, columnspan=4,
-                                       sticky="w", pady=(2, 0))
-
-        # --- output ---
-        box = ttk.LabelFrame(main, text="Output", padding=8)
-        box.grid(row=2, column=0, sticky="ew", pady=(0, 8))
-        box.columnconfigure(1, weight=1)
-
-        ttk.Label(box, text="Prefix:").grid(row=0, column=0, sticky="w", pady=2)
-        self.ent_prefix = ttk.Entry(box, textvariable=self.var_prefix)
-        self.ent_prefix.grid(row=0, column=1, sticky="ew", padx=6, pady=2)
-        self._tip(self.ent_prefix,
-                  "The new sequence is <prefix><sequence>, e.g. R_light_.")
-        chk = ttk.Checkbutton(box, text="from the channel", command=self._sync_prefix,
-                              variable=self.var_auto_prefix)
-        chk.grid(row=0, column=2, sticky="w", pady=2)
-        self._tip(chk, "Use R_, G_ or B_ according to the selected channel.")
-
-        chk = ttk.Checkbutton(box, text="Create a .seq for the result",
-                              variable=self.var_make_seq)
-        chk.grid(row=1, column=0, columnspan=3, sticky="w", pady=2)
-        self._tip(chk, "Writes the .seq so the new sequence shows up in Siril "
-                       "without a manual 'Search sequence'.")
-
-        # --- progress ---
-        box = ttk.LabelFrame(main, text="Progress", padding=8)
-        box.grid(row=3, column=0, sticky="nsew")
-        box.columnconfigure(0, weight=1)
-        box.rowconfigure(2, weight=1)
-        main.rowconfigure(3, weight=1)
-
-        ttk.Label(box, textvariable=self.var_status).grid(row=0, column=0,
-                                                          sticky="w")
-        self.progress = ttk.Progressbar(box, mode="determinate", maximum=100)
-        self.progress.grid(row=1, column=0, sticky="ew", pady=(4, 6))
-        self.text = scrolledtext.ScrolledText(box, height=12, wrap="none")
-        self.text.grid(row=2, column=0, sticky="nsew")
-        self.text.configure(state="disabled")
-
-        # --- buttons ---
-        buttons = ttk.Frame(main, padding=(0, 8, 0, 0))
-        buttons.grid(row=4, column=0, sticky="ew")
-        self.btn_run = ttk.Button(buttons, text="Extract", command=self._start)
-        self.btn_run.pack(side="right")
-        self.btn_close = ttk.Button(buttons, text="Close", command=self._on_close)
-        self.btn_close.pack(side="right", padx=(0, 6))
-        ttk.Button(buttons, text="Refresh list",
-                   command=self._refresh_sequences).pack(side="left")
-
-    def _tip(self, widget, text) -> None:
-        if tksiril is not None:
-            try:
-                tksiril.create_tooltip(widget, text)
-            except Exception:
-                pass
-
-    # -- widget callbacks ---------------------------------------------------
-
-    def _browse(self) -> None:
-        from tkinter import filedialog
-        initial = self.var_work.get() or os.getcwd()
-        chosen = filedialog.askdirectory(initialdir=initial, parent=self.root)
-        if chosen:
-            self.var_work.set(chosen)
-            self.var_seq.set("")
+        def __init__(self, siril, defaults):
+            super().__init__()
+            self.siril = siril
+            self.running = False
+            self.cancel = threading.Event()
             self.info = None
+            self.log_theme = "dark" if siril_is_dark(siril) else "light"
+
+            self.setWindowTitle("Extract a colour channel from an OSC sequence")
+            self._build_widgets(defaults)
+
+            self.log_line.connect(self._append_log)
+            self.progress_changed.connect(self._on_progress)
+            self.run_finished.connect(self._finish)
+
             self._refresh_sequences()
-            self.var_detected.set("Choose a sequence.")
-            self._sync_channel()
+            if self.cmb_seq.currentText().strip():
+                self._analyse()
+            else:
+                self._sync_channel()
+            self._sync_prefix()
+            self._fit_to_screen()
 
-    def _folder(self) -> Path | None:
-        text = self.var_work.get().strip()
-        if not text:
-            return None
-        path = Path(text)
-        return path if path.is_dir() else None
+        # -- layout ---------------------------------------------------------
 
-    def _refresh_sequences(self) -> None:
-        folder = self._folder()
-        names = list_sequences(folder) if folder else []
-        self.cmb_seq.configure(values=names)
-        if not self.var_seq.get() and len(names) == 1:
-            self.var_seq.set(names[0])
+        def _build_widgets(self, d) -> None:
+            outer = QtWidgets.QVBoxLayout(self)
+            outer.setContentsMargins(8, 8, 8, 8)
 
-    def _analyse(self) -> None:
-        folder = self._folder()
-        if folder is None:
-            self.var_detected.set("The working directory does not exist.")
-            self.info = None
-            self._sync_channel()
-            return
+            try:
+                wd = self.siril.get_siril_wd() or ""
+            except Exception:
+                wd = ""
 
-        name = clean_seq_name(self.var_seq.get())
-        self.var_seq.set(name)
-        if not name:
-            self.var_detected.set("Choose a sequence.")
-            self.info = None
-            self._sync_channel()
-            return
+            # --- sequence ---
+            box = QtWidgets.QGroupBox("Sequence")
+            grid = QtWidgets.QGridLayout(box)
+            self.ed_work = self._dir_row(
+                grid, 0, "Working directory:", d.work_dir or wd,
+                "The directory holding the sequence. Defaults to Siril's "
+                "working directory.")
+            self.ed_work.editingFinished.connect(self._on_folder_change)
 
-        try:
-            self.info = analyse_sequence(self.siril, folder, name)
-        except ExtractError as exc:
-            self.info = None
-            self.var_detected.set(str(exc))
-            self._sync_channel()
-            return
+            grid.addWidget(QtWidgets.QLabel("Sequence:"), 1, 0)
+            self.cmb_seq = QtWidgets.QComboBox()
+            self.cmb_seq.setEditable(True)
+            self.cmb_seq.setCurrentText(clean_seq_name(d.sequence or ""))
+            self.cmb_seq.setToolTip(
+                "Name of the sequence, e.g. 'light_'. The list holds the .seq "
+                "files found in the directory.")
+            self.cmb_seq.lineEdit().editingFinished.connect(self._analyse)
+            self.cmb_seq.activated.connect(lambda _i: self._analyse())
+            grid.addWidget(self.cmb_seq, 1, 1)
+            btn = QtWidgets.QPushButton("Analyse")
+            btn.clicked.connect(self._analyse)
+            grid.addWidget(btn, 1, 2)
 
-        text = self.info.summary()
-        if self.info.note:
-            text += "\n" + self.info.note
-        if self.info.kind == KIND_CFA:
-            text += ("\nExtraction produces a %dx%d sequence - half the width and "
-                     "half the height, one real sensor pixel per output pixel."
-                     % (self.info.width // 2, self.info.height // 2))
-        self.var_detected.set(text)
-        self._sync_channel()
+            self.lbl_detected = QtWidgets.QLabel("Choose a sequence.")
+            self.lbl_detected.setWordWrap(True)
+            grid.addWidget(self.lbl_detected, 2, 0, 1, 3)
+            outer.addWidget(box)
 
-    def _sync_channel(self) -> None:
-        """Enable only what makes sense for the sequence that was detected."""
-        info = self.info
-        usable = info is not None and info.is_osc
-        for radio in self.radios:
-            radio.state(["!disabled"] if usable else ["disabled"])
+            # --- channel ---
+            box = QtWidgets.QGroupBox("Channel to extract")
+            grid = QtWidgets.QGridLayout(box)
+            row = QtWidgets.QHBoxLayout()
+            self.channel_group = QtWidgets.QButtonGroup(self)
+            self.radios = []
+            wanted = (d.channel or "R").upper()
+            for channel in CHANNELS:
+                radio = QtWidgets.QRadioButton(
+                    "%s (%s)" % (CHANNEL_LABELS[channel], channel))
+                radio.setProperty("channel", channel)
+                radio.setChecked(channel == wanted)
+                radio.toggled.connect(self._sync_channel)
+                self.channel_group.addButton(radio)
+                row.addWidget(radio)
+                self.radios.append(radio)
+            row.addStretch(1)
+            grid.addLayout(row, 0, 0, 1, 2)
 
-        cfa = info is not None and info.kind == KIND_CFA
-        self.cmb_plane.configure(state="readonly" if cfa else "disabled")
-        if not cfa:
-            self.var_plane.set(PLANE_AUTO)
-        self.var_plane_hint.set(self._plane_hint(info, cfa))
+            grid.addWidget(QtWidgets.QLabel("CFA plane:"), 1, 0)
+            self.cmb_plane = QtWidgets.QComboBox()
+            self.cmb_plane.addItems([PLANE_AUTO, "0", "1", "2", "3"])
+            if d.plane is not None:
+                self.cmb_plane.setCurrentText(str(d.plane))
+            self.cmb_plane.setToolTip(
+                "Which quarter of the 2x2 Bayer cell to keep. Automatic reads "
+                "it from BAYERPAT; override it if red and blue come out "
+                "swapped.")
+            self.cmb_plane.currentIndexChanged.connect(self._sync_channel)
+            grid.addWidget(self.cmb_plane, 1, 1)
+            grid.setColumnStretch(1, 1)
 
-        self.btn_run.state(["!disabled"] if usable and not self.running
-                           else ["disabled"])
-        self._sync_prefix()
+            # A disabled widget does not show its tooltip, so the reason it is
+            # greyed out has to be visible without hovering.
+            self.lbl_plane_hint = QtWidgets.QLabel("")
+            self.lbl_plane_hint.setWordWrap(True)
+            grid.addWidget(self.lbl_plane_hint, 2, 0, 1, 2)
+            outer.addWidget(box)
 
-    def _plane_hint(self, info: SeqInfo | None, cfa: bool) -> str:
-        """Why the plane chooser is greyed out, or what Automatic will do."""
-        if info is None:
-            return ("Only for undebayered CFA sequences - select a sequence "
-                    "first.")
-        if info.kind == KIND_RGB:
-            return ("Not applicable: this sequence is already debayered, so R, G "
-                    "and B are real channels and there is no Bayer cell to cut.")
-        if info.kind == KIND_MONO:
-            return "Not applicable: this sequence is monochrome."
-        if not cfa:
-            return ("Only for undebayered CFA sequences - the type of this one "
-                    "could not be detected.")
+            # --- output ---
+            box = QtWidgets.QGroupBox("Output")
+            grid = QtWidgets.QGridLayout(box)
+            grid.addWidget(QtWidgets.QLabel("Prefix:"), 0, 0)
+            self.ed_prefix = QtWidgets.QLineEdit(d.prefix or "")
+            self.ed_prefix.setToolTip(
+                "The new sequence is <prefix><sequence>, e.g. R_light_.")
+            grid.addWidget(self.ed_prefix, 0, 1)
+            self.chk_auto_prefix = QtWidgets.QCheckBox("from the channel")
+            self.chk_auto_prefix.setChecked(d.prefix is None)
+            self.chk_auto_prefix.setToolTip(
+                "Use R_, G_ or B_ according to the selected channel.")
+            self.chk_auto_prefix.toggled.connect(self._sync_prefix)
+            grid.addWidget(self.chk_auto_prefix, 0, 2)
 
-        channel = self.var_channel.get()
-        planes = BAYER_PLANES.get(info.bayer_pattern)
-        if not planes:
-            return ("BAYERPAT '" + (info.bayer_pattern or "?") + "' is not one of "
-                    "RGGB / BGGR / GRBG / GBRG, so Automatic cannot work out the "
-                    "plane - choose it yourself.")
+            self.chk_make_seq = QtWidgets.QCheckBox(
+                "Create a .seq for the result")
+            self.chk_make_seq.setChecked(d.make_seq)
+            self.chk_make_seq.setToolTip(
+                "Writes the .seq so the new sequence shows up in Siril without "
+                "a manual 'Search sequence'.")
+            grid.addWidget(self.chk_make_seq, 1, 0, 1, 3)
+            grid.setColumnStretch(1, 1)
+            outer.addWidget(box)
 
-        value = planes[channel]
-        if isinstance(value, tuple):
-            return ("BAYERPAT %s: green sits on planes %d and %d. Automatic uses "
-                    "seqextract_Green, which combines both; picking a plane here "
-                    "keeps only that one."
-                    % (info.bayer_pattern, value[0], value[1]))
-        return ("BAYERPAT %s: Automatic takes plane %d for %s. Change it if red "
-                "and blue come out swapped."
-                % (info.bayer_pattern, value, CHANNEL_LABELS[channel].lower()))
+            outer.addWidget(self._log_box(), 1)
 
-    def _sync_prefix(self) -> None:
-        if self.var_auto_prefix.get():
-            self.var_prefix.set(self.var_channel.get() + "_")
-            self.ent_prefix.configure(state="disabled")
-        else:
-            self.ent_prefix.configure(state="normal")
+            buttons = QtWidgets.QHBoxLayout()
+            btn = QtWidgets.QPushButton("Refresh list")
+            btn.clicked.connect(self._refresh_sequences)
+            buttons.addWidget(btn)
+            buttons.addStretch(1)
+            btn = QtWidgets.QPushButton("Close")
+            btn.clicked.connect(self.close)
+            buttons.addWidget(btn)
+            self.btn_run = QtWidgets.QPushButton("Extract")
+            self.btn_run.setDefault(True)
+            self.btn_run.clicked.connect(self._start)
+            buttons.addWidget(self.btn_run)
+            outer.addLayout(buttons)
 
-    # -- starting the work --------------------------------------------------
+        # -- the sinks the pipeline writes into ------------------------------
 
-    def _collect(self):
-        """Build the same settings object argparse produces, from the form."""
-        from tkinter import messagebox
+        def sink_log(self, message, color) -> None:
+            self.log_line.emit(message, color)
 
-        folder = self._folder()
-        if folder is None:
-            messagebox.showerror("Error", "The working directory does not exist.",
-                                 parent=self.root)
-            return None
-        if self.info is None or not self.info.is_osc:
-            messagebox.showerror(
-                "Error", "Choose a sequence that holds OSC data first.",
-                parent=self.root)
-            return None
+        def sink_progress(self, done, total) -> None:
+            self.progress_changed.emit(done, total)
 
-        prefix = self.var_prefix.get().strip()
-        if not prefix:
-            messagebox.showerror("Error", "The output prefix must not be empty.",
-                                 parent=self.root)
-            return None
-        if any(character in prefix for character in '\\/:*?"<>|'):
-            messagebox.showerror("Error",
-                                 "The prefix must not contain path characters.",
-                                 parent=self.root)
-            return None
+        # -- slots, all on the GUI thread ------------------------------------
 
-        args = parse_args([])
-        args.work_dir = str(folder)
-        args.sequence = self.var_seq.get().strip()
-        args.channel = self.var_channel.get()
-        args.prefix = prefix
-        args.plane = (None if self.var_plane.get() == PLANE_AUTO
-                      else int(self.var_plane.get()))
-        args.make_seq = self.var_make_seq.get()
+        def _append_log(self, message, color=None) -> None:
+            colour = LOG_COLOURS[self.log_theme].get(
+                (color or "").lower() if color else "")
+            if colour:
+                self.text.appendHtml(
+                    '<span style="color:%s; white-space:pre">%s</span>'
+                    % (colour, html.escape(message)))
+            else:
+                self.text.appendPlainText(message)
 
-        out_root = prefix + args.sequence
-        existing = sequence_frames(folder, out_root)
-        if existing and not messagebox.askokcancel(
-                "Overwrite?",
-                "%d file(s) named %sNNNNN already exist and will be overwritten.\n\n"
-                "Continue?" % (len(existing), out_root), parent=self.root):
-            return None
-        return args
+        def _on_progress(self, done, total) -> None:
+            self.progress.setValue(int(100.0 * done / max(total, 1)))
 
-    def _start(self) -> None:
-        if self.running:
-            return
-        args = self._collect()
-        if args is None:
-            return
+        def _fit_to_screen(self, min_w=560, min_h=400) -> None:
+            """Size the window to its content, never larger than the screen."""
+            available = QtGui.QGuiApplication.primaryScreen().availableGeometry()
+            hint = self.sizeHint()
+            width = min(max(hint.width(), min_w), int(available.width() * 0.92))
+            height = min(max(hint.height(), min_h), int(available.height() * 0.85))
+            self.setMinimumSize(min(min_w, width), min(min_h, height))
+            self.resize(width, height)
+            self.move(available.x() + (available.width() - width) // 2,
+                      available.y() + (available.height() - height) // 3)
 
-        self.running = True
-        self.cancel.clear()
-        self.btn_run.state(["disabled"])
-        self.progress.configure(value=0)
-        self._clear_log()
-        self.var_status.set("Working...")
+        def _error(self, message: str) -> None:
+            QtWidgets.QMessageBox.critical(self, "Error", message)
 
-        thread = threading.Thread(target=self._worker, args=(args,), daemon=True)
-        thread.start()
+        def _log_box(self, height=130):
+            """The progress group box every script ends with."""
+            box = QtWidgets.QGroupBox("Progress")
+            inner = QtWidgets.QVBoxLayout(box)
+            self.lbl_status = QtWidgets.QLabel("Ready.")
+            inner.addWidget(self.lbl_status)
+            self.progress = QtWidgets.QProgressBar()
+            self.progress.setRange(0, 100)
+            inner.addWidget(self.progress)
+            self.text = QtWidgets.QPlainTextEdit()
+            self.text.setReadOnly(True)
+            self.text.setLineWrapMode(QtWidgets.QPlainTextEdit.LineWrapMode.NoWrap)
+            self.text.setMinimumHeight(height)
+            inner.addWidget(self.text, 1)
+            return box
 
-    def _worker(self, args) -> None:
-        """Runs off the GUI thread; every Siril command is issued from here."""
-        try:
-            out_root = run_pipeline(self.siril, args, self.info, self.cancel)
-            self.queue.put(("done", out_root, None))
-        except ExtractError as exc:
-            self.queue.put(("done", "", str(exc)))
-        except Exception as exc:
-            self.queue.put(("done", "", exc.__class__.__name__ + ": " + str(exc)))
+        def _dir_row(self, grid, row, label, value, tip, browse=True):
+            grid.addWidget(QtWidgets.QLabel(label), row, 0)
+            edit = QtWidgets.QLineEdit(value)
+            edit.setToolTip(tip)
+            grid.addWidget(edit, row, 1)
+            if browse:
+                button = QtWidgets.QPushButton("...")
+                button.setFixedWidth(32)
+                button.clicked.connect(lambda _=False, e=edit: self._browse(e))
+                grid.addWidget(button, row, 2)
+            grid.setColumnStretch(1, 1)
+            return edit
 
-    # -- passing messages from the worker thread to the GUI -----------------
+        # -- widget callbacks -----------------------------------------------
 
-    def sink_log(self, message, color) -> None:
-        self.queue.put(("log", message, color))
+        def _browse(self, edit) -> None:
+            start = edit.text().strip() or os.getcwd()
+            chosen = QtWidgets.QFileDialog.getExistingDirectory(
+                self, "Select a directory", start)
+            if chosen:
+                edit.setText(os.path.normpath(chosen))
+                self.cmb_seq.setCurrentText("")
+                self.info = None
+                self._on_folder_change()
+                self.lbl_detected.setText("Choose a sequence.")
+                self._sync_channel()
 
-    def sink_progress(self, done, total) -> None:
-        self.queue.put(("progress", done, total))
+        def _folder(self):
+            text = self.ed_work.text().strip()
+            folder = Path(text) if text else None
+            return folder if folder is not None and folder.is_dir() else None
 
-    def _pump(self) -> None:
-        import queue as queue_mod
-        if not self.alive:
-            return
-        try:
-            while True:
-                item = self.queue.get_nowait()
-                kind = item[0]
-                if kind == "log":
-                    self._append_log(item[1])
-                    if item[1].startswith("["):
-                        self.var_status.set(item[1])
-                elif kind == "progress":
-                    done, total = item[1], item[2]
-                    self.progress.configure(value=100.0 * done / max(total, 1))
-                elif kind == "done":
-                    self._finish(item[1], item[2])
-        except queue_mod.Empty:
-            pass
-        self.pump_id = self.root.after(100, self._pump)
-
-    def _append_log(self, message) -> None:
-        self.text.configure(state="normal")
-        self.text.insert("end", message + "\n")
-        self.text.see("end")
-        self.text.configure(state="disabled")
-
-    def _clear_log(self) -> None:
-        self.text.configure(state="normal")
-        self.text.delete("1.0", "end")
-        self.text.configure(state="disabled")
-
-    def _finish(self, out_root, error) -> None:
-        from tkinter import messagebox
-        self.running = False
-        self._sync_channel()
-        if error:
-            self.var_status.set("Extraction failed.")
-            self._append_log("ERROR: " + error)
-            messagebox.showerror("Extraction failed", error, parent=self.root)
-        else:
-            self.var_status.set("Done - new sequence: " + out_root)
-            self.progress.configure(value=100)
+        def _on_folder_change(self) -> None:
             self._refresh_sequences()
-            messagebox.showinfo("Done", "New sequence: " + out_root,
-                                parent=self.root)
 
-    def _on_close(self) -> None:
-        from tkinter import messagebox
-        if self.running:
-            if not messagebox.askyesno(
-                    "Extraction is running",
-                    "Extraction is still running. Close the window anyway?",
-                    parent=self.root):
+        def _refresh_sequences(self) -> None:
+            folder = self._folder()
+            names = list_sequences(folder) if folder else []
+            current = self.cmb_seq.currentText()
+            self.cmb_seq.blockSignals(True)
+            self.cmb_seq.clear()
+            self.cmb_seq.addItems(names)
+            self.cmb_seq.setCurrentText(
+                current or (names[0] if len(names) == 1 else ""))
+            self.cmb_seq.blockSignals(False)
+
+        def _channel(self) -> str:
+            for radio in self.radios:
+                if radio.isChecked():
+                    return radio.property("channel")
+            return "R"
+
+        def _analyse(self) -> None:
+            folder = self._folder()
+            if folder is None:
+                self.lbl_detected.setText(
+                    "The working directory does not exist.")
+                self.info = None
+                self._sync_channel()
                 return
-            self.cancel.set()
-        # stop the queue pump first, otherwise the pending callback fires
-        # after the window is gone and Tcl reports an invalid command
-        self.alive = False
-        if self.pump_id is not None:
+
+            name = clean_seq_name(self.cmb_seq.currentText())
+            if name != self.cmb_seq.currentText():
+                self.cmb_seq.setCurrentText(name)
+            if not name:
+                self.lbl_detected.setText("Choose a sequence.")
+                self.info = None
+                self._sync_channel()
+                return
+
             try:
-                self.root.after_cancel(self.pump_id)
-            except Exception:
-                pass
-        self.root.destroy()
+                self.info = analyse_sequence(self.siril, folder, name)
+            except ExtractError as exc:
+                self.info = None
+                self.lbl_detected.setText(str(exc))
+                self._sync_channel()
+                return
+
+            text = self.info.summary()
+            if self.info.note:
+                text += "\n" + self.info.note
+            if self.info.kind == KIND_CFA:
+                text += ("\nExtraction produces a %dx%d sequence - half the "
+                         "width and half the height, one real sensor pixel per "
+                         "output pixel."
+                         % (self.info.width // 2, self.info.height // 2))
+            self.lbl_detected.setText(text)
+            self._sync_channel()
+
+        def _sync_channel(self) -> None:
+            """Enable only what makes sense for the sequence that was detected."""
+            info = self.info
+            usable = info is not None and info.is_osc
+            for radio in self.radios:
+                radio.setEnabled(usable)
+
+            cfa = info is not None and info.kind == KIND_CFA
+            self.cmb_plane.setEnabled(cfa)
+            if not cfa and self.cmb_plane.currentText() != PLANE_AUTO:
+                self.cmb_plane.setCurrentText(PLANE_AUTO)
+            self.lbl_plane_hint.setText(self._plane_hint(info, cfa))
+
+            self.btn_run.setEnabled(usable and not self.running)
+            self._sync_prefix()
+
+        def _plane_hint(self, info, cfa: bool) -> str:
+            """Why the plane chooser is greyed out, or what Automatic will do."""
+            if info is None:
+                return ("Only for undebayered CFA sequences - select a sequence "
+                        "first.")
+            if info.kind == KIND_RGB:
+                return ("Not applicable: this sequence is already debayered, so "
+                        "R, G and B are real channels and there is no Bayer "
+                        "cell to cut.")
+            if info.kind == KIND_MONO:
+                return "Not applicable: this sequence is monochrome."
+            if not cfa:
+                return ("Only for undebayered CFA sequences - the type of this "
+                        "one could not be detected.")
+
+            channel = self._channel()
+            planes = BAYER_PLANES.get(info.bayer_pattern)
+            if not planes:
+                return ("BAYERPAT '" + (info.bayer_pattern or "?")
+                        + "' is not one of RGGB / BGGR / GRBG / GBRG, so "
+                          "Automatic cannot work out the plane - choose it "
+                          "yourself.")
+
+            value = planes[channel]
+            if isinstance(value, tuple):
+                return ("BAYERPAT %s: green sits on planes %d and %d. Automatic "
+                        "uses seqextract_Green, which combines both; picking a "
+                        "plane here keeps only that one."
+                        % (info.bayer_pattern, value[0], value[1]))
+            return ("BAYERPAT %s: Automatic takes plane %d for %s. Change it if "
+                    "red and blue come out swapped."
+                    % (info.bayer_pattern, value,
+                       CHANNEL_LABELS[channel].lower()))
+
+        def _sync_prefix(self) -> None:
+            if self.chk_auto_prefix.isChecked():
+                self.ed_prefix.setText(self._channel() + "_")
+                self.ed_prefix.setEnabled(False)
+            else:
+                self.ed_prefix.setEnabled(True)
+
+        # -- starting the work ----------------------------------------------
+
+        def _collect(self):
+            """Build the same settings object argparse produces, from the form."""
+            folder = self._folder()
+            if folder is None:
+                self._error("The working directory does not exist.")
+                return None
+            if self.info is None or not self.info.is_osc:
+                self._error("Choose a sequence that holds OSC data first.")
+                return None
+
+            prefix = self.ed_prefix.text().strip()
+            if not prefix:
+                self._error("The output prefix must not be empty.")
+                return None
+            if any(ch in prefix for ch in r'\/:*?"<>|'):
+                self._error("The prefix must not contain path characters.")
+                return None
+
+            args = parse_args([])
+            args.work_dir = str(folder)
+            args.sequence = self.cmb_seq.currentText().strip()
+            args.channel = self._channel()
+            args.prefix = prefix
+            plane = self.cmb_plane.currentText()
+            args.plane = None if plane == PLANE_AUTO else int(plane)
+            args.make_seq = self.chk_make_seq.isChecked()
+
+            out_root = prefix + args.sequence
+            existing = sequence_frames(folder, out_root)
+            if existing:
+                answer = QtWidgets.QMessageBox.question(
+                    self, "Overwrite?",
+                    "%d file(s) named %sNNNNN already exist and will be "
+                    "overwritten.\n\nContinue?" % (len(existing), out_root))
+                if answer != QtWidgets.QMessageBox.StandardButton.Yes:
+                    return None
+            return args
+
+        def _start(self) -> None:
+            if self.running:
+                return
+            args = self._collect()
+            if args is None:
+                return
+
+            self.running = True
+            self.cancel.clear()
+            self.btn_run.setEnabled(False)
+            self.progress.setValue(0)
+            self.text.clear()
+            self.lbl_status.setText("Working...")
+
+            thread = threading.Thread(target=self._worker, args=(args,),
+                                      daemon=True)
+            thread.start()
+
+        def _worker(self, args) -> None:
+            """Runs off the GUI thread; every Siril command is issued here."""
+            try:
+                self.run_finished.emit(
+                    run_pipeline(self.siril, args, self.info, self.cancel),
+                    None)
+            except ExtractError as exc:
+                self.run_finished.emit(None, str(exc))
+            except Exception as exc:
+                self.run_finished.emit(
+                    None, exc.__class__.__name__ + ": " + str(exc))
+
+        def _append_log(self, message, color=None) -> None:
+            colour = LOG_COLOURS[self.log_theme].get(
+                (color or "").lower() if color else "")
+            if colour:
+                self.text.appendHtml(
+                    '<span style="color:%s; white-space:pre">%s</span>'
+                    % (colour, html.escape(message)))
+            else:
+                self.text.appendPlainText(message)
+            if message.startswith("["):
+                self.lbl_status.setText(message)
+
+        def _finish(self, out_root, error) -> None:
+            self.running = False
+            self._sync_channel()
+            if error:
+                self.lbl_status.setText("Extraction failed.")
+                self.text.appendPlainText("ERROR: " + error)
+                QtWidgets.QMessageBox.critical(self, "Extraction failed", error)
+                return
+
+            self.lbl_status.setText("Done - new sequence: " + out_root)
+            self.progress.setValue(100)
+            self._refresh_sequences()
+            QtWidgets.QMessageBox.information(self, "Done",
+                                              "New sequence: " + out_root)
+
+        def closeEvent(self, event) -> None:
+            if self.running:
+                answer = QtWidgets.QMessageBox.question(
+                    self, "Extraction is running",
+                    "Extraction is still running. Close the window anyway?")
+                if answer != QtWidgets.QMessageBox.StandardButton.Yes:
+                    event.ignore()
+                    return
+                self.cancel.set()
+            event.accept()
+
+
+def siril_is_dark(siril) -> bool:
+    """Siril's own light/dark preference (gui.theme: 0 dark, 1 light)."""
+    try:
+        return siril.get_siril_config("gui", "theme") == 0
+    except Exception:
+        return False
+
+
+def apply_siril_theme(app, siril) -> None:
+    """Match Qt to Siril's light/dark preference."""
+    if not siril_is_dark(siril):
+        return  # the light theme is Qt's default look
+
+    app.setStyle("Fusion")
+    palette = QtGui.QPalette()
+    role = QtGui.QPalette.ColorRole
+    window = QtGui.QColor(53, 53, 53)
+    base = QtGui.QColor(35, 35, 35)
+    text = QtGui.QColor(220, 220, 220)
+    for target, colour in ((role.Window, window), (role.Base, base),
+                           (role.AlternateBase, window), (role.Button, window),
+                           (role.ToolTipBase, window), (role.WindowText, text),
+                           (role.Text, text), (role.ButtonText, text),
+                           (role.ToolTipText, text),
+                           (role.Highlight, QtGui.QColor(42, 130, 218)),
+                           (role.HighlightedText, QtGui.QColor(0, 0, 0))):
+        palette.setColor(target, colour)
+    disabled = QtGui.QPalette.ColorGroup.Disabled
+    for target in (role.WindowText, role.Text, role.ButtonText):
+        palette.setColor(disabled, target, QtGui.QColor(127, 127, 127))
+    app.setPalette(palette)
 
 
 def launch_gui(siril, defaults) -> int:
     """Open the dialog; returns 0 (errors are reported inside the window)."""
-    root = build_root()
-    gui = ChannelExtractGUI(root, siril, defaults)
-    add_log_sink(gui.sink_log)
-    add_progress_sink(gui.sink_progress)
-    try:
-        if tksiril is not None:
-            tksiril.elevate(root)
-    except Exception:
-        pass
-    root.mainloop()
+    if QtWidgets is None:
+        raise ExtractError(
+            "PyQt6 is not available in this Python environment.")
+
+    app = QtWidgets.QApplication.instance()
+    owns_app = app is None
+    if owns_app:
+        app = QtWidgets.QApplication(sys.argv[:1])
+    apply_siril_theme(app, siril)
+
+    window = ChannelExtractWindow(siril, defaults)
+    add_log_sink(window.sink_log)
+    add_progress_sink(window.sink_progress)
+    window.show()
+    window.raise_()
+    window.activateWindow()
+
+    if owns_app:
+        app.exec()
     return 0
 
 
