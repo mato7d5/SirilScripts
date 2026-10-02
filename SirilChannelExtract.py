@@ -1,5 +1,24 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+#
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# Copyright (C) 2026 Martin Mancuska <martin@martin-in.space>
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License along
+# with this program; if not, write to the Free Software Foundation, Inc.,
+# 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+#
 """
 Extract a single colour channel (R, G or B) from an OSC sequence (Siril 1.4+).
 
@@ -37,6 +56,8 @@ Without arguments the GUI opens. Command line arguments pre-fill the form; with
 """
 
 from __future__ import annotations
+
+__version__ = "1.0.0"
 
 import argparse
 import html
@@ -646,7 +667,8 @@ if QtWidgets is not None:
             self.info = None
             self.log_theme = "dark" if siril_is_dark(siril) else "light"
 
-            self.setWindowTitle("Extract a colour channel from an OSC sequence")
+            self.setWindowTitle(
+                "Extract a colour channel from an OSC sequence v" + __version__)
             self._build_widgets(defaults)
 
             self.log_line.connect(self._append_log)
@@ -1155,6 +1177,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                     "sequence into a new sequence (Siril 1.4+).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
+    p.add_argument("--version", action="version",
+                   version="%(prog)s " + __version__)
     p.add_argument("--no-gui", dest="gui", action="store_false",
                    help="Skip the dialog and start straight away.")
     p.add_argument("--work-dir", default=None,
