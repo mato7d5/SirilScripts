@@ -53,7 +53,7 @@ Copy this file into your Siril scripts directory to get it in the script menu.
 
 from __future__ import annotations
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 import csv
 import html
@@ -263,10 +263,10 @@ class FrameStat:
 # key, label, unit, higher values are worse, enabled by default,
 # limit caption, limit range, decimals
 METRICS = [
-    ("fwhm", "FWHM", "px", True, True, "max:", (0.0, 100.0), 2),
-    ("ecc", "Eccentricity", "", True, True, "max:", (0.0, 1.0), 2),
-    ("stars", "Stars", "", False, True, "min:", (0.0, 1000000.0), 0),
-    ("bg", "Background", "", True, False, "max:", (0.0, 65535.0), 5),
+    ("fwhm", "FWHM", "px", True, True, "reject if >", (0.0, 100.0), 2),
+    ("ecc", "Eccentricity", "", True, True, "reject if >", (0.0, 1.0), 2),
+    ("stars", "Stars", "", False, True, "reject if <", (0.0, 1000000.0), 0),
+    ("bg", "Background", "", True, False, "reject if >", (0.0, 65535.0), 5),
 ]
 METRIC = {meta[0]: meta for meta in METRICS}
 
@@ -287,6 +287,7 @@ class MetricSummary:
     high: float | None = None
     threshold: float | None = None
     failing: int = 0
+    missing: int = 0        # frames without a value (no stars, not measured)
 
 
 def metric_values(frames: list, key: str) -> np.ndarray:
@@ -328,7 +329,8 @@ def evaluate(frames: list, rules: list) -> dict:
     for rule in rules:
         label, higher_is_worse = METRIC[rule.key][1], METRIC[rule.key][3]
         values = metric_values(frames, rule.key)
-        summary = MetricSummary(threshold=rule.limit)
+        summary = MetricSummary(threshold=rule.limit,
+                                missing=len(frames) - values.size)
         if values.size:
             summary.median = float(np.median(values))
             summary.low, summary.high = float(values.min()), float(values.max())
@@ -1268,15 +1270,22 @@ class SelectorWindow(QtWidgets.QWidget):
             if summary.median is None:
                 info.setText("")
                 continue
-            text = "median %s   (%s – %s)" % (
-                fmt_value(rule.key, summary.median),
+            text = "data: min %s · median %s · max %s" % (
                 fmt_value(rule.key, summary.low),
+                fmt_value(rule.key, summary.median),
                 fmt_value(rule.key, summary.high))
             if rule.enabled:
-                text += "   →  %d frame(s) %s" % (
+                text += "   →  %d frame(s) %s the limit" % (
                     summary.failing,
                     "above" if METRIC[rule.key][3] else "below")
+            tooltip = "Measured values of the analysed frames."
+            if summary.missing:
+                tooltip += ("\n%d frame(s) without stars or measurement are "
+                            "not included (they are rejected anyway)."
+                            % summary.missing)
+                text += "   (%d without data)" % summary.missing
             info.setText(text)
+            info.setToolTip(tooltip)
             info.setEnabled(rule.enabled)
         self._fill_table()
         self._refresh_charts()
