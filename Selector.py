@@ -63,6 +63,7 @@ import shutil
 import sys
 import threading
 from dataclasses import dataclass, field
+from datetime import timezone
 
 import numpy as np
 
@@ -210,6 +211,27 @@ def fmt_bg(value) -> str:
     if value is None:
         return "-"
     return "%.1f" % value if abs(value) >= 10 else "%.5f" % value
+
+
+def header_date(header) -> str:
+    """DATE-OBS as the FITS header has it (UT), to the second."""
+    if not isinstance(header, dict):
+        return ""
+    value = header.get("DATE-OBS")
+    if isinstance(value, (list, tuple)):
+        value = value[0] if value else None
+    return str(value).strip().replace("T", " ")[:19] if value else ""
+
+
+def utc_text(date) -> str:
+    """sirilpy hands DATE-OBS over as a naive local time; turn it back to UT."""
+    if date is None:
+        return ""
+    try:
+        date = date.astimezone(timezone.utc)
+    except (ValueError, OSError):
+        pass
+    return date.strftime("%Y-%m-%d %H:%M:%S")
 
 
 # --------------------------------------------------------------------------- #
@@ -636,7 +658,7 @@ class NumericItem(QtWidgets.QTableWidgetItem):
 
 COLUMNS = ["#", "File", "Reject", "Suggestion", "FWHM", "wFWHM",
            "Eccentricity", "Roundness", "Stars", "Background", "Noise",
-           "Date", "Reason"]
+           "Date (UT)", "Reason"]
 COL_NUM, COL_FILE, COL_REJECT, COL_SUGGEST = 0, 1, 2, 3
 COL_REASON = len(COLUMNS) - 1
 
@@ -1147,7 +1169,7 @@ class SelectorWindow(QtWidgets.QWidget):
             try:
                 img = siril.get_seq_imgdata(i)
                 if img is not None and img.date_obs is not None:
-                    frame.date = img.date_obs.strftime("%Y-%m-%d %H:%M:%S")
+                    frame.date = utc_text(img.date_obs)
             except Exception:
                 pass
             if reg is not None and reg.fwhm > 0:
@@ -1205,12 +1227,17 @@ class SelectorWindow(QtWidgets.QWidget):
                     frame.background = float(stats.median)
                     frame.noise = float(stats.bgnoise) or None
                 try:
-                    keywords = siril.get_image_keywords()
-                    if keywords is not None and keywords.date_obs is not None:
-                        frame.date = keywords.date_obs.strftime(
-                            "%Y-%m-%d %H:%M:%S")
+                    frame.date = header_date(
+                        siril.get_image_fits_header(return_as="dict"))
                 except Exception:
                     pass
+                if not frame.date:
+                    try:
+                        keywords = siril.get_image_keywords()
+                        if keywords is not None:
+                            frame.date = utc_text(keywords.date_obs)
+                    except Exception:
+                        pass
             except s.SirilError as exc:
                 frame.error = "could not be measured: %s" % exc
                 self.post_log("%s: %s" % (name, frame.error), "red")
