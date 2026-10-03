@@ -12,6 +12,7 @@ and reports progress into Siril's log, so the Siril window stays responsive.
 | [`VarStarOSCPreprocess.py`](VarStarOSCPreprocess.py) | Full OSC preprocessing: masters, light calibration, registration and optional single-channel extraction — deliberately stopping before stacking. |
 | [`DepthFITSConversion.py`](DepthFITSConversion.py) | Converts a folder of FITS files, or the frames of one sequence, between 32-bit float and 16-bit unsigned integer, reporting any clipping. |
 | [`Selector.py`](Selector.py) | Measures FWHM, eccentricity, star count and background of every calibrated light frame, shows them in a table and charts with a keep / reject suggestion, deletes, moves or unselects the frames you reject, and copies or moves the accepted ones to an `accepted` subfolder. |
+| [`StarsStatistics.py`](StarsStatistics.py) | Detects the stars on the image loaded in Siril or on every frame of a sequence and lists their RA, Dec, magnitude calibrated with a catalogue (APASS, Gaia, NOMAD), flux (16-bit ADU) and exposure time — per frame or averaged (mean / median) over the sequence — in a table that can be copied or saved as CSV. |
 
 ## Requirements
 
@@ -20,7 +21,8 @@ and reports progress into Siril's log, so the Siril window stays responsive.
   PyQt6 6.11 / Qt 6.11), so normally there is nothing to install. If it is
   somehow missing, the scripts ask `sirilpy.ensure_installed()` for it. The
   scripts that have a `--no-gui` mode do not need Qt at all in that mode;
-  `SirilSync.py` and `Selector.py` are GUI-only and always need it.
+  `SirilSync.py`, `Selector.py` and `StarsStatistics.py` are GUI-only and
+  always need it.
 
 ## Installation
 
@@ -42,6 +44,7 @@ python siril_dark_calibration.py --work-dir "D:/astro/M31" --no-gui
 `SirilSync.py` has no command-line interface — it is GUI only, because it needs
 an image loaded in the running Siril instance. `Selector.py` is GUI only as
 well: rejecting frames is a decision you make while looking at the charts.
+`StarsStatistics.py` is GUI only too — its result is a table in a window.
 
 ## The dialogs
 
@@ -968,6 +971,165 @@ Siril, its `.seq` is removed and rebuilt from the remaining files. The rebuilt
 sequence has no registration data, so **register it again** before stacking.
 Frames stored inside a single SER / FITSEQ file cannot be removed, copied or
 moved one by one — use *unselect* for those.
+
+---
+
+# StarsStatistics.py
+
+## What it is for
+
+A star list with coordinates and photometry: for every star Siril detects, the
+script reports where it is (pixel position and RA / Dec), how bright it is
+(flux, and a magnitude calibrated against a star catalogue) and under which
+exposure it was taken. Run it on a single
+image — a stack, or one sub — or on a whole sequence, where the stars are
+followed from frame to frame and averaged.
+
+## Workflow
+
+1. Run **StarsStatistics** from the Scripts menu. It starts on the sequence
+   loaded in Siril, otherwise on the loaded image.
+2. Choose the source:
+   - **Image loaded in Siril** — `findstar` is run on it. Tick *Use the stars
+     already detected in Siril* to keep the list from the Dynamic PSF window
+     instead (for example stars you picked by hand).
+   - **Sequence** — a sequence from the folder or one of its direct
+     subfolders. Numbered FITS frames (`r_pp_light_00001.fit`, ...) are listed
+     even when Siril has not written their `.seq` yet; the script creates it.
+     By default only the frames selected in the sequence are measured.
+3. For a sequence, choose the result: **arithmetic mean**, **median**, or
+   **every frame separately**.
+4. Leave **Calibrate the magnitudes with a catalogue** ticked and pick the
+   catalogue (see below) — the image must be plate solved for it.
+5. Press **Measure**. The table opens in its own window when it is done.
+6. In the table window, pick the delimiter and the decimal separator, then
+   **Copy CSV** or **Save CSV...**. The *CSV* tab shows the exact text.
+7. **Search** the table from the bar above it:
+   - **Name** — shows only the stars whose name contains the text, as you
+     type; case and spaces do not matter (`ekcep` finds `EK Cep`).
+   - **RA / Dec** — `21:41:21.5`, `21 41 21.5`, `21h41m21.5s` or degrees
+     (`325.34`); Dec likewise (`+69:41:34`, `69d41m34s`, `69.693`). **Find**
+     (or Enter) shows the stars within the radius (10″ by default) and selects
+     the nearest one; the distance is shown next to the bar.
+   - Both can be combined; **Show all** clears the search. The search only
+     hides rows — **Copy CSV** and **Save CSV...** still take the whole table.
+8. **Double-click a row** to find that star in Siril: it gets a yellow circle
+   with a cross-hair and its number, and the view is centred on it at 100 %
+   zoom (or more, if you were zoomed in further). The star is looked up on the
+   image Siril shows — for a sequence on the frame currently shown, else from
+   its RA / Dec. The next double-click moves the circle.
+
+**Show table again** builds a new table from the last measurement with the
+options set now — switching between mean, median and per frame, or changing the
+matching, does not need a new measurement. Changing the catalogue does.
+
+## The columns
+
+| Column | Meaning |
+| --- | --- |
+| `star` | Star number, 1 = the brightest. In a sequence the same star keeps its number in every frame, so the per-frame table can be pivoted into light curves. |
+| `name` | Name of the star: its variable star designation from VSX (e.g. `EK Cep`, `ASASSN-V J...`), else SIMBAD's main identifier (`HD 207636`, `TYC 4465-965-1`, `Gaia DR3 ...`); prefixes such as `V*` are dropped. Empty for an uncatalogued star. Only with **Star names from VSX and SIMBAD** ticked (on by default; online, plate-solved image). |
+| `x`, `y` | Position in the image, px (`x_ref`, `y_ref` in the averaged table: the position in the reference frame). |
+| `ra_deg`, `dec_deg` | RA / Dec in degrees, from the plate solution. Empty when the image is not plate solved. `ra_hms` / `dec_dms` are added on request. |
+| `mag` | Calibrated magnitude, the instrumental magnitude `-2.5 log10(flux_adu16)` plus the frame's zero point (see below) — for every star, also those missing in the catalogue. Only with a catalogue: without one the table has no magnitude, since an uncalibrated magnitude has only an arbitrary, negative scale — use the flux. |
+| `cat_V`, `cat_B` / `cat_G`, `cat_BP` | The magnitudes of the matching catalogue star, named after the catalogue's bands; empty for a star not in the catalogue. |
+| `cat_err`, `cat_dist_arcsec` | APASS's error of `cat_V`, and the distance to the catalogue star. |
+| `zero_point` | Per-frame table: the zero point of that frame. |
+| `flux_adu16` | Integral of the fitted PSF above the local background (Gaussian or Moffat, whichever Siril fitted), in **16-bit ADU**: a 32-bit float image (0..1) is scaled by 65535, a 16-bit image is used as is. It is the sum over all the star's pixels, so it can be far above 65535. |
+| `max_flux` | Value of the star's brightest pixel, background included, in 16-bit ADU. This one is limited to 65535: a star near it is saturated. |
+| `fwhm_px`, `saturated` | FWHM (mean of both axes), and whether the star has saturated pixels. |
+| `exposure_s` | `EXPTIME` / `EXPOSURE` from the FITS header; empty when the file has none (e.g. a TIFF without it). |
+| `gain` | Camera gain setting, `GAIN` from the FITS header (e.g. 100 on a ZWO camera; 0 is a valid value). Empty when the header has none, e.g. for a DSLR. In the averaged table the median over the frames. |
+| `date_obs` | `DATE-OBS` of the frame (single image and per-frame table). |
+| `n_frames`, `mag_sigma`, `saturated_frames` | Averaged table only (`mag_sigma` only with a catalogue): in how many frames the star was found, the scatter between the frames (standard deviation for the mean, 1.4826 × MAD for the median), and in how many frames it was saturated. |
+
+Tick **Leave out saturated stars** to drop them from the table (and from the
+averages) — their flux and magnitude are wrong.
+
+Tick **Mark the stars in Siril with circles** to see which stars the table
+holds: every star of the table gets a circle on the image Siril shows — green,
+red for a saturated star — optionally **with the star numbers** from the `star`
+column, so a row of the table is easy to find in the image. For a sequence the
+frame Siril currently shows is marked, with the positions measured on that
+frame. The circles live on Siril's overlay; its overlay button clears them, and
+a new table replaces them. Marking a few thousand stars takes a few seconds and
+can be stopped with **Stop**.
+
+## Star names
+
+With **Star names from VSX and SIMBAD** ticked, the script also runs
+`conesearch -cat=vsx` and `conesearch -cat=simbad` (down to mag 18) on the
+plate-solved image — for a sequence on its first plate-solved frame — and names
+every star that has a catalogue object within 3″ (at least 1.5 pixels, after
+the same offset removal as below). VSX comes first, so a known
+variable star is always listed under its variable star designation; SIMBAD
+names the rest. On the EK Cep test field that is about 1250 named objects,
+mostly Gaia, Tycho and UCAC4 numbers besides the variable stars.
+
+## Catalogue magnitudes
+
+The catalogue stars of the field are read with Siril's `conesearch` (once — for
+a sequence on its first plate-solved frame), down to the chosen magnitude:
+
+| Catalogue | Bands | Note |
+| --- | --- | --- |
+| **APASS** | V, B | Online. The usual choice for variable stars measured in the green channel. |
+| **Gaia DR3, local** | G | Offline, from Siril's local catalogue. G is a broad band, so expect a colour-dependent offset. |
+| **Gaia DR3, online** | G, BP | Online, through VizieR. |
+| **NOMAD** | V, B | Online. |
+
+Every measured star is paired with the nearest catalogue star within the
+radius, each catalogue star with one measured star at most. Two things keep
+that pairing reliable whatever the image scale:
+
+- **Offset removal.** The measured positions are usually shifted against the
+  catalogue as a whole — by the plate solution and by where Siril puts a
+  pixel's centre, typically half a pixel. A first pass with a wide radius
+  measures that shift (median over all pairs) and it is taken off before the
+  real pairing. The log reports it per frame.
+- **Radius floor.** The radius (3″ by default) is never smaller than
+  1.5 pixels. At a coarse scale such as 3.2″/px, 3″ is less than one pixel.
+
+On the RW Lac field (3.2″/px, 1.2″ offset) this raised the APASS matches from
+3300 to 6075 and found RW Lac itself, which was measured 3.5″ from its
+catalogue position.
+Each frame then gets its **zero point**: the median of `cat − instrumental mag` over the
+unsaturated matched stars, with outliers (variable stars, blends, wrong matches)
+clipped at 3σ. `mag = instrumental mag + zero point` — a per-frame zero point also
+removes changes of transparency and airmass between the frames. The log lists
+each frame's zero point and its scatter.
+
+There is no colour term: a star much redder or bluer than average comes out a
+little off, and the catalogue's own errors grow at its faint end. On the test
+field (EK Cep, APASS V) the calibrated `mag` agreed with `cat_V` to 0.04 mag
+(1σ) between V 10 and 14. Saturated stars keep a wrong `mag` — tick **Leave out
+saturated stars** to drop them.
+
+## Matching stars in a sequence
+
+Every frame is loaded and measured on its own, so the script has to work out
+which detection in one frame is the same star as in another:
+
+| Mode | Use it for |
+| --- | --- |
+| **RA / Dec** | Plate-solved frames (e.g. after `seqplatesolve`). Works on frames that are not registered. Default tolerance 3″. |
+| **Pixel position** | Registered (aligned) frames, e.g. an `r_` sequence. Default tolerance 3 px. |
+| **Automatic** | RA / Dec when every frame is plate solved, pixel position otherwise. |
+
+Matching starts from the sequence's reference frame. Each star is paired with
+the nearest detection within the tolerance, at most one per frame; a star that
+matches nothing starts a new entry. The averaged table keeps only stars found in
+at least the given share of the frames (50 % by default).
+
+Only sequences of separate files can be measured — the frames of a SER or
+FITSEQ file cannot be loaded one by one. The frame list, the selection and the
+reference frame are read from the `.seq` file itself, so the script also works
+in headless Siril (`siril-cli`), where `load_seq` is not allowed. In the GUI the
+sequence is loaded in Siril again after the run.
+
+`date_obs` is taken from the `DATE-OBS` card exactly as written (UT). sirilpy
+hands the date over converted to the computer's local time, so it is not used
+when the header has the card.
 
 ## License
 
