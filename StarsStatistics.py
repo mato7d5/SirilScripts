@@ -29,7 +29,8 @@ or on every frame of a sequence, and lists every star with
   magnitude     calibrated with a catalogue (APASS, Gaia, NOMAD - read with
                 Siril's conesearch): every frame's zero point is fitted to
                 the catalogue stars and added to the instrumental magnitude,
-                -2.5 log10(flux); the catalogue's own magnitude is listed too
+                25 - 2.5 log10(flux), which is listed too, as is the
+                catalogue's own magnitude
   flux          the integral of the fitted PSF above the background, in
                 16-bit ADU (0..65535) whatever the bit depth of the image
   max flux      the star's brightest pixel, 16-bit ADU
@@ -101,6 +102,9 @@ RESULT_MEAN, RESULT_MEDIAN, RESULT_FRAMES = "mean", "median", "frames"
 MATCH_AUTO, MATCH_SKY, MATCH_PIXEL = "auto", "sky", "pixel"
 
 DELIMITERS = [(";", ";"), (",", ","), ("Tab", "\t")]
+
+# Nominal zero point of the instrumental magnitude, 25 - 2.5 log10(flux).
+INSTRUMENTAL_ZP = 25.0
 
 # Circles drawn around the stars in Siril, packed 0xRRGGBBAA.
 MARK_COLOUR = 0x40FF40FF
@@ -383,10 +387,11 @@ class Star:
 
     @property
     def mag_inst(self) -> float | None:
-        """Instrumental magnitude from the 16-bit flux."""
+        """Instrumental magnitude from the 16-bit flux, on the usual scale
+        with a nominal zero point of 25 (as IRAF's phot), so it is positive."""
         if self.flux is None or self.flux <= 0:
             return None
-        return -2.5 * math.log10(self.flux)
+        return INSTRUMENTAL_ZP - 2.5 * math.log10(self.flux)
 
 
 @dataclass
@@ -843,14 +848,19 @@ COLUMN_INFO = {
     "dec_deg": ("dec_deg", "%.6f", "Declination, degrees (J2000)."),
     "ra_hms": ("ra_hms", "%s", "Right ascension, hh:mm:ss."),
     "dec_dms": ("dec_dms", "%s", "Declination, ±dd:mm:ss."),
-    "mag": ("mag", "%.3f", "Calibrated magnitude: -2.5 log10(flux_adu16) + "
-                           "the zero point of the frame, fitted to the "
-                           "catalogue stars. "
+    "mag": ("mag", "%.3f", "Calibrated magnitude: mag_inst + the zero "
+                           "point of the frame, fitted to the catalogue "
+                           "stars. "
                            "Given for every star, also those missing in the "
                            "catalogue."),
-    "mag_sigma": ("mag_sigma", "%.4f", "Scatter of mag between the frames: "
-                                       "standard deviation for the mean, "
-                                       "1.4826 x MAD for the median."),
+    "mag_sigma": ("mag_sigma", "%.4f", "Scatter of mag (of mag_inst "
+                                       "without a catalogue) between the "
+                                       "frames: standard deviation for the "
+                                       "mean, 1.4826 x MAD for the median."),
+    "mag_inst": ("mag_inst", "%.4f", "Instrumental magnitude, "
+                                     "25 - 2.5 log10(flux_adu16). Not "
+                                     "calibrated, but fine for differential "
+                                     "photometry within a frame."),
     "cat_mag": ("cat_mag", "%.3f", "Magnitude of the matching catalogue "
                                    "star."),
     "cat_bmag": ("cat_bmag", "%.3f", "Second (blue) magnitude of the "
@@ -859,9 +869,9 @@ COLUMN_INFO = {
     "cat_dist": ("cat_dist_arcsec", "%.2f", "Distance to the matching "
                                             "catalogue star, arcsec."),
     "zero_point": ("zero_point", "%.4f", "Zero point of the frame: median "
-                                         "of cat_mag - instrumental mag "
-                                         "over the unsaturated catalogue "
-                                         "stars."),
+                                         "of cat_mag - mag_inst over the "
+                                         "unsaturated catalogue stars; "
+                                         "mag = mag_inst + zero_point."),
     "flux_adu16": ("flux_adu16", "%.1f", "Integral of the fitted PSF above "
                                          "the background, in 16-bit ADU "
                                          "(0..65535 scale)."),
@@ -896,11 +906,12 @@ def make_columns(keys, catalogue=None):
 
 
 def catalogue_keys(catalogue, averaged=False) -> list:
-    """The magnitude columns - none without a catalogue, as an
-    uncalibrated magnitude only has an arbitrary (negative) scale."""
+    """The magnitude columns: always the instrumental magnitude, and with a
+    catalogue the calibrated one and the catalogue's."""
+    sigma = ["mag_sigma"] if averaged else []
     if catalogue is None:
-        return []
-    keys = ["mag"] + (["mag_sigma"] if averaged else []) + ["cat_mag"]
+        return ["mag_inst"] + sigma
+    keys = ["mag"] + sigma + ["mag_inst", "cat_mag"]
     if catalogue[3]:
         keys.append("cat_bmag")
     if catalogue[0] == "apass":
@@ -914,10 +925,11 @@ def star_row_values(st: Star, frame: FrameResult) -> dict:
         "ra_deg": st.ra, "dec_deg": st.dec,
         "ra_hms": ra_to_hms(st.ra) if st.ra is not None else None,
         "dec_dms": dec_to_dms(st.dec) if st.dec is not None else None,
-        "mag": st.mag, "cat_mag": st.cat_mag,
+        "mag": st.mag, "mag_inst": st.mag_inst, "cat_mag": st.cat_mag,
         "cat_bmag": st.cat_bmag, "cat_mag_err": st.cat_mag_err,
         "cat_dist": st.cat_dist, "zero_point": frame.zero_point,
-        "flux_adu16": st.flux, "max_flux": st.max_flux, "fwhm_px": st.fwhm, "saturated": int(st.saturated),
+        "flux_adu16": st.flux, "max_flux": st.max_flux, "fwhm_px": st.fwhm,
+        "saturated": int(st.saturated),
         "exposure_s": frame.exposure, "gain": frame.gain,
         "date_obs": frame.date or None,
     }
@@ -987,6 +999,9 @@ def build_table(measurement: Measurement, result: str, hms: bool,
             continue
         stars = [st for _f, st in good]
         mag, mag_sigma = combine([st.mag for st in stars], result)
+        mag_inst, inst_sigma = combine([st.mag_inst for st in stars], result)
+        if catalogue is None:
+            mag_sigma = inst_sigma
         ref_star = next((st for f, st in detections if f is reference), None)
         values = {
             "star": star_id, "n_frames": len(good),
@@ -995,7 +1010,7 @@ def build_table(measurement: Measurement, result: str, hms: bool,
             "y_ref": ref_star.y if ref_star else None,
             "ra_deg": combine_ra([st.ra for st in stars], result),
             "dec_deg": combine([st.dec for st in stars], result)[0],
-            "mag": mag, "mag_sigma": mag_sigma,
+            "mag": mag, "mag_sigma": mag_sigma, "mag_inst": mag_inst,
             # the same catalogue star in every frame; the median keeps a
             # single frame that matched a neighbour from changing it
             "cat_mag": combine([st.cat_mag for st in stars],
@@ -1597,7 +1612,7 @@ class StarsStatisticsWindow(QtWidgets.QWidget):
         self.cat_box.setToolTip(
             "Reads the catalogue stars of the field with Siril's conesearch "
             "(the image must be plate solved), pairs them with the measured "
-            "stars and fits each frame's zero point.\nmag = instrumental mag + zero "
+            "stars and fits each frame's zero point.\nmag = mag_inst + zero "
             "point is then given for every star, also those missing in the "
             "catalogue.\nChanging these settings needs a new measurement.")
         grid = QtWidgets.QGridLayout(self.cat_box)

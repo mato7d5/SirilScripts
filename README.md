@@ -1031,17 +1031,18 @@ matching, does not need a new measurement. Changing the catalogue does.
 | `name` | Name of the star: its variable star designation from VSX (e.g. `EK Cep`, `ASASSN-V J...`), else SIMBAD's main identifier (`HD 207636`, `TYC 4465-965-1`, `Gaia DR3 ...`); prefixes such as `V*` are dropped. Empty for an uncatalogued star. Only with **Star names from VSX and SIMBAD** ticked (on by default; online, plate-solved image). |
 | `x`, `y` | Position in the image, px (`x_ref`, `y_ref` in the averaged table: the position in the reference frame). |
 | `ra_deg`, `dec_deg` | RA / Dec in degrees, from the plate solution. Empty when the image is not plate solved. `ra_hms` / `dec_dms` are added on request. |
-| `mag` | Calibrated magnitude, the instrumental magnitude `-2.5 log10(flux_adu16)` plus the frame's zero point (see below) — for every star, also those missing in the catalogue. Only with a catalogue: without one the table has no magnitude, since an uncalibrated magnitude has only an arbitrary, negative scale — use the flux. |
+| `mag` | Calibrated magnitude, `mag_inst` plus the frame's zero point (see below) — for every star, also those missing in the catalogue. Only with a catalogue. |
+| `mag_inst` | Instrumental magnitude `25 − 2.5 log10(flux_adu16)` — the usual scale with a nominal zero point of 25 (as IRAF's `phot`), so it is positive. Always in the table and the CSV, with or without a catalogue; not calibrated, but differences between stars of one frame are real magnitude differences. |
 | `cat_V`, `cat_B` / `cat_G`, `cat_BP` | The magnitudes of the matching catalogue star, named after the catalogue's bands; empty for a star not in the catalogue. |
 | `cat_err`, `cat_dist_arcsec` | APASS's error of `cat_V`, and the distance to the catalogue star. |
-| `zero_point` | Per-frame table: the zero point of that frame. |
+| `zero_point` | Per-frame table: the zero point of that frame, `mag − mag_inst`. |
 | `flux_adu16` | Integral of the fitted PSF above the local background (Gaussian or Moffat, whichever Siril fitted), in **16-bit ADU**: a 32-bit float image (0..1) is scaled by 65535, a 16-bit image is used as is. It is the sum over all the star's pixels, so it can be far above 65535. |
 | `max_flux` | Value of the star's brightest pixel, background included, in 16-bit ADU. This one is limited to 65535: a star near it is saturated. |
 | `fwhm_px`, `saturated` | FWHM (mean of both axes), and whether the star has saturated pixels. |
 | `exposure_s` | `EXPTIME` / `EXPOSURE` from the FITS header; empty when the file has none (e.g. a TIFF without it). |
 | `gain` | Camera gain setting, `GAIN` from the FITS header (e.g. 100 on a ZWO camera; 0 is a valid value). Empty when the header has none, e.g. for a DSLR. In the averaged table the median over the frames. |
 | `date_obs` | `DATE-OBS` of the frame (single image and per-frame table). |
-| `n_frames`, `mag_sigma`, `saturated_frames` | Averaged table only (`mag_sigma` only with a catalogue): in how many frames the star was found, the scatter between the frames (standard deviation for the mean, 1.4826 × MAD for the median), and in how many frames it was saturated. |
+| `n_frames`, `mag_sigma`, `saturated_frames` | Averaged table only: in how many frames the star was found, the scatter of `mag` (of `mag_inst` without a catalogue) between the frames (standard deviation for the mean, 1.4826 × MAD for the median), and in how many frames it was saturated. |
 
 Tick **Leave out saturated stars** to drop them from the table (and from the
 averages) — their flux and magnitude are wrong.
@@ -1093,9 +1094,9 @@ that pairing reliable whatever the image scale:
 On the RW Lac field (3.2″/px, 1.2″ offset) this raised the APASS matches from
 3300 to 6075 and found RW Lac itself, which was measured 3.5″ from its
 catalogue position.
-Each frame then gets its **zero point**: the median of `cat − instrumental mag` over the
+Each frame then gets its **zero point**: the median of `cat − mag_inst` over the
 unsaturated matched stars, with outliers (variable stars, blends, wrong matches)
-clipped at 3σ. `mag = instrumental mag + zero point` — a per-frame zero point also
+clipped at 3σ. `mag = mag_inst + zero point` — a per-frame zero point also
 removes changes of transparency and airmass between the frames. The log lists
 each frame's zero point and its scatter.
 
