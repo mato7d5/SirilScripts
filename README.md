@@ -1042,6 +1042,7 @@ matching, does not need a new measurement. Changing the catalogue does.
 | `exposure_s` | `EXPTIME` / `EXPOSURE` from the FITS header; empty when the file has none (e.g. a TIFF without it). |
 | `gain` | Camera gain setting, `GAIN` from the FITS header (e.g. 100 on a ZWO camera; 0 is a valid value). Empty when the header has none, e.g. for a DSLR. In the averaged table the median over the frames. |
 | `filter` | `FILTER` from the FITS header (e.g. `L`, `V`, `Ha`); empty when the header has none. In the averaged table the most common filter of the frames. |
+| `focal_ratio` | Focal ratio (f-number), `FOCRATIO` from the FITS header (e.g. `3.45`); empty when the header has none. In the averaged table the median over the frames. |
 | `date_obs` | `DATE-OBS` of the frame (single image and per-frame table). |
 | `n_frames`, `mag_sigma`, `saturated_frames` | Averaged table only: in how many frames the star was found, the scatter of `mag` (of `mag_inst` without a catalogue) between the frames (standard deviation for the mean, 1.4826 × MAD for the median), and in how many frames it was saturated. |
 

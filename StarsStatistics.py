@@ -417,6 +417,7 @@ class FrameResult:
     exposure: float | None = None      # s
     gain: float | None = None          # camera gain setting (GAIN)
     filter: str | None = None          # FILTER from the FITS header
+    focal_ratio: float | None = None   # FOCRATIO from the FITS header
     date: str = ""
     float_data: bool = False
     plate_solved: bool = False
@@ -903,6 +904,9 @@ COLUMN_INFO = {
                            "(e.g. 100 on a ZWO camera)."),
     "filter": ("filter", "%s", "FILTER from the FITS header; empty when the "
                                "header has none."),
+    "focal_ratio": ("focal_ratio", "%g", "Focal ratio (f-number), FOCRATIO "
+                                         "from the FITS header; empty when "
+                                         "the header has none."),
     "date_obs": ("date_obs", "%s", "DATE-OBS of the frame, UT."),
 }
 
@@ -947,7 +951,7 @@ def star_row_values(st: Star, frame: FrameResult) -> dict:
         "flux_adu16": st.flux, "max_flux": st.max_flux, "fwhm_px": st.fwhm,
         "saturated": int(st.saturated),
         "exposure_s": frame.exposure, "gain": frame.gain,
-        "filter": frame.filter,
+        "filter": frame.filter, "focal_ratio": frame.focal_ratio,
         "date_obs": frame.date or None,
     }
 
@@ -970,7 +974,8 @@ def build_table(measurement: Measurement, result: str, hms: bool,
                 + sexa
                 + catalogue_keys(catalogue) + zero
                 + ["flux_adu16", "max_flux", "fwhm_px", "saturated",
-                   "exposure_s", "gain", "filter", "date_obs"])
+                   "exposure_s", "gain", "filter", "focal_ratio",
+                   "date_obs"])
         rows = []
         for frame in measurement.frames:
             stars = sorted((st for st in frame.stars if keep(st)),
@@ -993,7 +998,7 @@ def build_table(measurement: Measurement, result: str, hms: bool,
                                 "dec_deg"] + sexa
             + catalogue_keys(catalogue, averaged=True)
             + ["flux_adu16", "max_flux", "fwhm_px", "saturated_frames",
-               "exposure_s", "gain", "filter"])
+               "exposure_s", "gain", "filter", "focal_ratio"])
     used_frames = [f for f in measurement.frames if f.stars]
     min_count = max(1, int(math.ceil(len(used_frames) * min_percent / 100.0)))
     reference = (measurement.frames[measurement.reference]
@@ -1045,6 +1050,8 @@ def build_table(measurement: Measurement, result: str, hms: bool,
                                   result)[0],
             "gain": combine([f.gain for f, _st in good], RESULT_MEDIAN)[0],
             "filter": most_common([f.filter for f, _st in good]),
+            "focal_ratio": combine([f.focal_ratio for f, _st in good],
+                                   RESULT_MEDIAN)[0],
         }
         values["ra_hms"] = (ra_to_hms(values["ra_deg"])
                             if values["ra_deg"] is not None else None)
@@ -2114,6 +2121,7 @@ class StarsStatisticsWindow(QtWidgets.QWidget):
             frame.exposure = header_number(header, EXPOSURE_KEYS)
         frame.gain = header_gain(header)
         frame.filter = header_text(header, "FILTER")
+        frame.focal_ratio = header_number(header, ("FOCRATIO",))
         if frame.gain is None and keywords is not None and keywords.gain:
             frame.gain = float(keywords.gain)
         frame.date = header_date(header) or (
